@@ -3,7 +3,7 @@
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/238 
 
 ## Found by 
-ctf\_sec, ayeslick, cccz, Jeiwan, pashov, Nyx, kenzo, Bnke0x0, IllIllI, HonorLt, hyh
+Jeiwan, ctf\_sec, ayeslick, hyh, kenzo
 
 ## Summary
 
@@ -262,12 +262,337 @@ https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L2
     }
 ```
 
-# Issue H-2: Sense redeem is unavailable and funds are frozen for underlyings whose decimals are smaller than the corresponding IBT decimals 
+## Discussion
+
+**dmitriia**
+
+Escalate for 50 USDC
+Real dups here are #21, #80, #153, #218, which are about uninitialized market allowing unlimited mint as no real transfer is done due to the missing contract code check.
+Others are dups among themselves, dealing with infinite loop of feeding the contract with Illuminate PTs.
+
+**sherlock-admin**
+
+ > Escalate for 50 USDC
+> Real dups here are #21, #80, #153, #218, which are about uninitialized market allowing unlimited mint as no real transfer is done due to the missing contract code check.
+> Others are dups among themselves, dealing with infinite loop of feeding the contract with Illuminate PTs.
+
+You've created a valid escalation for 50 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue H-2: External PT redeem functions can be reentered to double count the received underlying funds 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/236 
+
+## Found by 
+Jeiwan, minhtrng, hyh, kenzo, Holmgren
+
+## Summary
+
+There are two versions of external PT redeem() functions in Redeemer: multi-PT one and Sense. Both calculated underlying funds returned from redeem as a balance difference, both can be reentered, and Sense one calls user-supplied adapter to perform the redeem.
+
+An attacker can create a pre-cooked contract that first calls redeem() for all other types of PT, then proceeds to call the correct Sense adapter. All the funds obtained from PT except Sense will be double counted. The attacker will now need to burn its Illuminate PTs first, obtaining the major part of the underlying funds and making the contract insolvent for all other users.
+
+## Vulnerability Detail
+
+Bob the attacker will:
+
+* Lend 1 block before maturity, wait 1 block, then run the following with elevated gas cost
+
+* Create wrapper 'a', that do call Sense pool, but before that calls multi-PT redeem with all PTs available on Lender's balance the corresponding number of times
+
+* Call correct Sense adapter to redeem. Result is that all besides Sense is double counted in `holdings`
+
+* Be first to redeem Illuminate PTs, obtaining up to double amount of the funds
+
+* Other users will soon be unable to redeem due to the lack of underlying funds in the contract
+
+## Impact
+
+Bob will be able to extract the most part of the total underlying funds, making the contract up to insolvent for all other users.
+
+It can be done without any additional requirements, so setting the severity to be high.
+
+## Code Snippet
+
+Swivel, Yield, Element, Pendle, APWine, Tempus and Notional (multi-PT) redeem() isn't protected from reentracy:
+
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L209-L333
+
+```solidity
+    /// @notice redeem method for Swivel, Yield, Element, Pendle, APWine, Tempus and Notional protocols
+    /// @param p principal value according to the MarketPlace's Principals Enum
+    /// @param u address of an underlying asset
+    /// @param m maturity (timestamp) of the market
+    /// @return bool true if the redemption was successful
+    function redeem(
+        uint8 p,
+        address u,
+        uint256 m
+    ) external returns (bool) {
+        // Get the principal token that is being redeemed by the user
+        address principal = IMarketPlace(marketPlace).token(u, m, p);
+
+        // Get the maturity for the given principal token
+        uint256 maturity;
+        if (p == uint8(MarketPlace.Principals.Swivel)) {
+            maturity = ISwivelToken(principal).maturity();
+        } else if (p == uint8(MarketPlace.Principals.Yield)) {
+            maturity = IYieldToken(principal).maturity();
+        } else if (p == uint8(MarketPlace.Principals.Element)) {
+            maturity = IElementToken(principal).unlockTimestamp();
+        } else if (p == uint8(MarketPlace.Principals.Pendle)) {
+            maturity = IPendleToken(principal).expiry();
+        } else if (p == uint8(MarketPlace.Principals.Tempus)) {
+            maturity = ITempusPool(ITempusToken(principal).pool())
+                .maturityTime();
+        } else if (p == uint8(MarketPlace.Principals.Apwine)) {
+            // APWine's maturity is retrieved indirectly via the PT's
+            // futureVault and Controller
+            address futureVault = IAPWineToken(principal).futureVault();
+
+            address controller = IAPWineFutureVault(futureVault)
+                .getControllerAddress();
+
+            uint256 duration = IAPWineFutureVault(futureVault)
+                .PERIOD_DURATION();
+
+            maturity = IAPWineController(controller).getNextPeriodStart(
+                duration
+            );
+        } else if (p == uint8(MarketPlace.Principals.Notional)) {
+            maturity = INotional(principal).getMaturity();
+        } else {
+            revert Exception(6, p, 0, address(0), address(0));
+        }
+
+        // Verify that the token has matured
+        if (maturity > block.timestamp) {
+            revert Exception(7, maturity, 0, address(0), address(0));
+        }
+
+        // Cache the lender to save gas on sload
+        address cachedLender = lender;
+
+        // Get the amount to be redeemed
+        uint256 amount = IERC20(principal).balanceOf(cachedLender);
+
+        // Receive the principal token from the lender contract
+        Safe.transferFrom(
+            IERC20(principal),
+            cachedLender,
+            address(this),
+            amount
+        );
+
+        // Get the starting balance of the underlying held by the redeemer
+        uint256 starting = IERC20(u).balanceOf(address(this));
+
+        if (p == uint8(MarketPlace.Principals.Swivel)) {
+            // Redeems principal tokens from Swivel
+            if (!ISwivel(swivelAddr).redeemZcToken(u, maturity, amount)) {
+                revert Exception(15, 0, 0, address(0), address(0));
+            }
+        } else if (p == uint8(MarketPlace.Principals.Yield)) {
+            // Redeems principal tokens from Yield
+            IYieldToken(principal).redeem(address(this), amount);
+        } else if (p == uint8(MarketPlace.Principals.Element)) {
+            // Redeems principal tokens from Element
+            IElementToken(principal).withdrawPrincipal(amount, address(this));
+        } else if (p == uint8(MarketPlace.Principals.Pendle)) {
+            // Get the forge contract for the principal token
+            address forge = IPendleToken(principal).forge();
+
+            // Get the forge ID of the principal token
+            bytes32 forgeId = IPendleForge(forge).forgeId();
+
+            // Redeem the tokens from the Pendle contract
+            IPendle(pendleAddr).redeemAfterExpiry(forgeId, u, maturity);
+
+            // Get the compounding asset for this market
+            address compounding = IPendleToken(principal)
+                .underlyingYieldToken();
+
+            // Redeem the compounding to token to the underlying
+            IConverter(converter).convert(
+                compounding,
+                u,
+                IERC20(compounding).balanceOf(address(this))
+            );
+        } else if (p == uint8(MarketPlace.Principals.Tempus)) {
+            // Retrieve the pool for the principal token
+            address pool = ITempusToken(principal).pool();
+
+            // Redeems principal tokens from Tempus
+            ITempus(tempusAddr).redeemToBacking(pool, amount, 0, address(this));
+        } else if (p == uint8(MarketPlace.Principals.Apwine)) {
+            apwineWithdraw(principal, u, amount);
+        } else if (p == uint8(MarketPlace.Principals.Notional)) {
+            // Redeems principal tokens from Notional
+            INotional(principal).redeem(
+                INotional(principal).maxRedeem(address(this)),
+                address(this),
+                address(this)
+            );
+        }
+
+        // Calculate how much underlying was redeemed
+        uint256 redeemed = IERC20(u).balanceOf(address(this)) - starting;
+
+        // Update the holding for this market
+        holdings[u][m] = holdings[u][m] + redeemed;
+
+        emit Redeem(p, u, m, redeemed, msg.sender);
+        return true;
+    }
+```
+
+Sense redeem() records `IERC20(u).balanceOf(address(this)) - starting` as recovered underlying funds, calling user-supplied adapter `a` in-between balance snapshots:
+
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L335-L398
+
+```solidity
+    /// @notice redeem method signature for Sense
+    /// @param p principal value according to the MarketPlace's Principals Enum
+    /// @param u address of an underlying asset
+    /// @param m maturity (timestamp) of the market
+    /// @param s Sense's maturity is needed to extract the pt address
+    /// @param a Sense's adapter for this market
+    /// @return bool true if the redemption was successful
+    function redeem(
+        uint8 p,
+        address u,
+        uint256 m,
+        uint256 s,
+        address a
+    ) external returns (bool) {
+        // Check the principal is Sense
+        if (p != uint8(MarketPlace.Principals.Sense)) {
+            revert Exception(6, p, 0, address(0), address(0));
+        }
+
+        // Get Sense's principal token for this market
+        IERC20 token = IERC20(IMarketPlace(marketPlace).token(u, m, p));
+
+        // Cache the lender to save on SLOAD operations
+        address cachedLender = lender;
+
+        // Get the balance of tokens to be redeemed by the user
+        uint256 amount = token.balanceOf(cachedLender);
+
+        // Transfer the user's tokens to the redeem contract
+        Safe.transferFrom(token, cachedLender, address(this), amount);
+
+        // Get the starting balance to verify the amount received afterwards
+        uint256 starting = IERC20(u).balanceOf(address(this));
+
+        // Get the divider from the adapter
+        ISenseDivider divider = ISenseDivider(ISenseAdapter(a).divider());
+
+        // Redeem the tokens from the Sense contract
+        ISenseDivider(divider).redeem(a, s, amount);
+
+        // Get the compounding token that is redeemed by Sense
+        address compounding = ISenseAdapter(a).target();
+
+        // Redeem the compounding token back to the underlying
+        IConverter(converter).convert(
+            compounding,
+            u,
+            IERC20(compounding).balanceOf(address(this))
+        );
+
+        // Get the amount received
+        uint256 redeemed = IERC20(u).balanceOf(address(this)) - starting;
+
+        // Verify that underlying are received 1:1 - cannot trust the adapter
+        if (redeemed < amount) {
+            revert Exception(13, 0, 0, address(0), address(0));
+        }
+
+        // Update the holdings for this market
+        holdings[u][m] = holdings[u][m] + redeemed;
+
+        emit Redeem(p, u, m, redeemed, msg.sender);
+        return true;
+    }
+```
+
+Bob will supply `a` which first call multi-PT version of redeem() above with all available types of PTs, maximizing the underlying output, then calls the correct Sense adapter to obtain the Sense part. All underlying funds from all other types of PTs will be counted twice, first in the multi-PT redeem, second in Sense redeem.
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+If there is no desire to refactor Sense support from the current version, that calls user-supplied contract, consider adding reentrancy guard modifiers to both redeem() functions.
+
+Illuminate redeem modifies the `holdings` in the opposite direction, but for the sake of reducing the surface altogether consider adding reentrancy guard there as well. Additional cost is well justified in the both cases.
+
+
+## Discussion
+
+**dmitriia**
+
+Escalate for 50 USDC
+Lending and redeeming reentrancy surfaces are located in different contracts and do not have exactly same mechanics.
+This is for redeeming reentrancy and duplicates looks to be #64, #67, #217, #232
+
+This escalation is for the same root cause as both of 179
+
+**sherlock-admin**
+
+ > Escalate for 50 USDC
+> Lending and redeeming reentrancy surfaces are located in different contracts and do not have exactly same mechanics.
+> This is for redeeming reentrancy and duplicates looks to be #64, #67, #217, #232
+> 
+> This escalation is for the same root cause as both of 179
+
+You've created a valid escalation for 50 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue H-3: Sense redeem is unavailable and funds are frozen for underlyings whose decimals are smaller than the corresponding IBT decimals 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/228 
 
 ## Found by 
-0x52, hyh
+hyh, 0x52
 
 ## Summary
 
@@ -373,12 +698,85 @@ Manual Review
 
 In order to verify `redeemed = IERC20(u).balanceOf(address(this)) - starting` vs initial `IERC20(IMarketPlace(marketPlace).token(u, m, p))`'s balance of Lender, consider introducing the decimals adjustment multiplier, i.e. read Sense PT decimals, underlying decimals, and multiply the smaller decimals amount to match the bigger decimals one in order to compare.
 
-# Issue H-3: No returning of premium if there is no swap to PT 
+# Issue H-4: User can accidentally burn their iPT tokens during redemption 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/222 
+
+## Found by 
+Jeiwan
+
+## Summary
+User can accidentally burn their iPT tokens during redemption
+## Vulnerability Detail
+The `redeem` function that redeems iPT tokens burns iPT tokens even when the `holdings` mapping is empty and the redeemed amount is 0 ([Redeemer.sol#L403-L434](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L403-L434)).
+## Impact
+A user can accidentally call the `redeem` function after maturity but before the other `redeem` function is called (the one that burns external PT tokens–they have identical names). User's iPT tokens will be burned and no underlying tokens will be sent in exchange.
+## Code Snippet
+[Redeemer.sol#L403](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L403):
+```solidity
+function redeem(address u, uint256 m) external unpaused(u, m) {
+    // Get Illuminate's principal token for this market
+    IERC5095 token = IERC5095(
+        IMarketPlace(marketPlace).token(
+            u,
+            m,
+            uint8(MarketPlace.Principals.Illuminate)
+        )
+    );
+
+    // Verify the token has matured
+    if (block.timestamp < token.maturity()) {
+        revert Exception(7, block.timestamp, m, address(0), address(0));
+    }
+
+    // Get the amount of tokens to be redeemed from the sender
+    uint256 amount = token.balanceOf(msg.sender);
+
+    // Calculate how many tokens the user should receive
+    uint256 redeemed = (amount * holdings[u][m]) / token.totalSupply();
+
+    // Update holdings of underlying
+    holdings[u][m] = holdings[u][m] - redeemed;
+
+    // Burn the user's principal tokens
+    // @audit burns iPT tokens even if  the holdings mapping is empty
+    token.authBurn(msg.sender, amount);
+
+    // Transfer the original underlying token back to the user
+    Safe.transfer(IERC20(u), msg.sender, redeemed);
+
+    emit Redeem(0, u, m, redeemed, msg.sender);
+}
+```
+## Tool used
+Manual Review
+## Recommendation
+Consider disallowing calling the second `redeem` function (the one that redeems iPT tokens) before the first `redeem` function (the one that redeems external PT tokens) is called.
+
+
+
+## Discussion
+
+**sourabhmarathe**
+
+Input validation is not within the scope of the audit. We expect to use other resources to ensure that users are executing the redemptions properly outside of the smart contract.
+
+**JTraversa**
+
+Duplicate of #239 
+
+**Evert0x**
+
+Not a duplicate of #239 but of #81
+
+
+
+# Issue H-5: No returning of premium if there is no swap to PT 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/211 
 
 ## Found by 
-hyh, cccz
+cccz, hyh
 
 ## Summary
 
@@ -521,12 +919,12 @@ https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L4
 +                  }
 ```
 
-# Issue H-4: Lend or mint after maturity 
+# Issue H-6: Lend or mint after maturity 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/208 
 
 ## Found by 
-Jeiwan, 0x52, Holmgren, kenzo, HonorLt
+HonorLt, kenzo, Holmgren
 
 ## Summary
 The protocol does not forbid lending or minting after the maturity leaving the possibility to profit from early users.
@@ -585,12 +983,12 @@ Manual Review
 ## Recommendation
 Lend/mint should be forbidden post-maturity.
 
-# Issue H-5: There are no Illuminate PT transfers from the owner in ERC5095's withdraw and redeem before maturity 
+# Issue H-7: There are no Illuminate PT transfers from the owner in ERC5095's withdraw and redeem before maturity 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/195 
 
 ## Found by 
-cryptphi, bin2chen, Holmgren, hansfriese, hyh
+cryptphi, minhtrng, bin2chen, hansfriese, hyh, kenzo, Holmgren
 
 ## Summary
 
@@ -955,14 +1353,33 @@ I believe the ERC5095 doesn't normally hold any balance. The tests in https://gi
 
 Originally, I felt that this did not put user funds at risk but certainly agreed with the report (I believe we have a fix for it). However, it seems like this is a serious enough problem where we can keep the severity level High. I removed the dispute label.
 
+**0x00052**
+
+Escalate for 10 USDC
+
+Don't agree with high severity. ERC5095 normally doesn't hold any balance so any balance in the contract to be "stolen" was accidentally sent there. Agreed that withdraw/redeem won't work pre-maturity but given that it is basically just a wrapper on Marketplace#sellPrincipleToken, users can just use that instead. Medium seems more appropriate given that users have alternatives to sell pre-maturity and no funds are at risk
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC
+> 
+> Don't agree with high severity. ERC5095 normally doesn't hold any balance so any balance in the contract to be "stolen" was accidentally sent there. Agreed that withdraw/redeem won't work pre-maturity but given that it is basically just a wrapper on Marketplace#sellPrincipleToken, users can just use that instead. Medium seems more appropriate given that users have alternatives to sell pre-maturity and no funds are at risk
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 
-# Issue H-6: Yield, Swivel, Element, APWine and Sense lend() are subject to reentracy resulting in Illuminate PT over-mint 
+
+# Issue H-8: Yield, Swivel, Element, APWine and Sense lend() are subject to reentracy resulting in Illuminate PT over-mint 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/179 
 
 ## Found by 
-cryptphi, Jeiwan, windowhan\_kalosec, Holmgren, kenzo, HonorLt, hyh, minhtrng
+Jeiwan, cryptphi, minhtrng, windowhan\_kalosec, HonorLt, hyh, kenzo, Holmgren
 
 ## Summary
 
@@ -1449,7 +1866,61 @@ Notice that although Pendle, Tempus and Notional versions of lend() look to be r
 
 In all these cases either direct removal of the attack surface or precautious control for it do justify the reentracy guard gas cost.
 
-# Issue H-7: Lender#lend for Sense has mismatched decimals 
+## Discussion
+
+**Minh-Trng**
+
+Escalate for 1 USDC
+I would like to request reevaluation of the duplication grouping. Currently, all issues that mention reentrancy are grouped together and count as 1 issue. As you can see in the list of duplicates, most wardens have submitted 2 issues, one for the affected lending functions and one for the single redeem function that is affected. Grouping them as a single issue would effectively punish those that put in the effort to identify both the affected lending and redeem parts, as well as describing the vulnerability details and impact (which are different), compared to those who only submitted the issue for the lending related code.
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> I would like to request reevaluation of the duplication grouping. Currently, all issues that mention reentrancy are grouped together and count as 1 issue. As you can see in the list of duplicates, most wardens have submitted 2 issues, one for the affected lending functions and one for the single redeem function that is affected. Grouping them as a single issue would effectively punish those that put in the effort to identify both the affected lending and redeem parts, as well as describing the vulnerability details and impact (which are different), compared to those who only submitted the issue for the lending related code.
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**SheldonHolmgren**
+
+Escalate for 100 USDC
+
+I just want to add more weight to the issue raised by @Minh-Trng above. They wrote it better than I could so I quote:
+> I would like to request reevaluation of the duplication grouping. Currently, all issues that mention reentrancy are grouped together and count as 1 issue. As you can see in the list of duplicates, most wardens have submitted 2 issues, one for the affected lending functions and one for the single redeem function that is affected. Grouping them as a single issue would effectively punish those that put in the effort to identify both the affected lending and redeem parts, as well as describing the vulnerability details and impact (which are different), compared to those who only submitted the issue for the lending related code.
+
+**sherlock-admin**
+
+ > Escalate for 100 USDC
+> 
+> I just want to add more weight to the issue raised by @Minh-Trng above. They wrote it better than I could so I quote:
+> > I would like to request reevaluation of the duplication grouping. Currently, all issues that mention reentrancy are grouped together and count as 1 issue. As you can see in the list of duplicates, most wardens have submitted 2 issues, one for the affected lending functions and one for the single redeem function that is affected. Grouping them as a single issue would effectively punish those that put in the effort to identify both the affected lending and redeem parts, as well as describing the vulnerability details and impact (which are different), compared to those who only submitted the issue for the lending related code.
+
+You've created a valid escalation for 100 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue H-9: Lender#lend for Sense has mismatched decimals 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/164 
 
@@ -1500,127 +1971,7 @@ Manual Review
 
 Query the decimals of the Sense principal and use that to adjust the decimals to match the decimals of the vault.
 
-# Issue H-8: Swivel redeem function parameter signature mismatch in Redeemer.sol 
-
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/145 
-
-## Found by 
-ctf\_sec
-
-## Summary
-
-Swivel redeem function signature mismatch in Redeemer.sol
-
-## Vulnerability Detail
-
-The redeem function for Swivel is implemented below:
-
-```solidity
-if (p == uint8(MarketPlace.Principals.Swivel)) {
-    // Redeems principal tokens from Swivel
-    if (!ISwivel(swivelAddr).redeemZcToken(u, maturity, amount)) {
-        revert Exception(15, 0, 0, address(0), address(0));
-    }
-```
-
-We can look into the redeemZcToken interface:
-
-```solidity
-function redeemZcToken(
-    address u,
-    uint256 m,
-    uint256 a
-) external returns (bool);
-```
-
-And we compare with the redeemZcToken implementation for Swivel's github:
-
-https://github.com/Swivel-Finance/swivel/blob/3cc31302f84c2b1777a53c11b22c58ec6ef17888/contracts/v3/src/Swivel.sol#L1007
-
-```solidity
-    /// @notice Allows zcToken holders to redeem their tokens for underlying tokens after maturity has been reached (via MarketPlace).
-    /// @param p Protocol Enum value associated with this market pair
-    /// @param u Underlying token address associated with the market
-    /// @param m Maturity timestamp of the market
-    /// @param a Amount of zcTokens being redeemed
-    function redeemZcToken(
-        uint8 p,
-        address u,
-        uint256 m,
-        uint256 a
-    ) external returns (bool) {
-```
-
-We miss-matched the parameter and function signature!
-
-## Impact
-
-Redeem for swivel will not work.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L277-L282
-
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/interfaces/ISwivel.sol#L6-L19
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-We recommend making the interface align with the implementation:
-
-We change from 
-
-```solidity
-function redeemZcToken(
-    address u,
-    uint256 m,
-    uint256 a
-) external returns (bool);
-```
-
-to
-
-```solidity
-function redeemZcToken(
-    uint8 p,
-    address u,
-    uint256 m,
-    uint256 a
-) external returns (bool);
-```
-
-and we change from
-
-```solidity
-if (!ISwivel(swivelAddr).redeemZcToken(u, maturity, amount)) {
-    revert Exception(15, 0, 0, address(0), address(0));
-}
-```
-
-to
-
-```solidity
-if (!ISwivel(swivelAddr).redeemZcToken(p, u, maturity, amount)) {
-    revert Exception(15, 0, 0, address(0), address(0));
-}
-```
-
-## Discussion
-
-**IllIllI000**
-
-@sourabhmarathe This is the version that matches the [address](https://etherscan.io/address/0x093e4D20D9b2c3c8f68E8a20262D8Fb8EBCE08FA#code) in Contracts.sol, and it has the parameters used in the contest code: https://github.com/Swivel-Finance/swivel/blob/3cc31302f84c2b1777a53c11b22c58ec6ef17888/contracts/v2/swivel/Swivel.sol#L482
-
-**sourabhmarathe**
-
-Yes, that's right. However, Swivel v3 will be launched well in advance of Illuminate's launch. In lieu of a fork-mode test, we have manually confirmed the viability of Swivel up to this point. We will make sure to update the fork-mode test to v3 as part of this review process prior to launch.
-
-
-
-# Issue H-9: Users can mint free Illuminate PTs if underlying decimals don't match external PTs 
+# Issue H-10: Users can mint free Illuminate PTs if underlying decimals don't match external PTs 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/120 
 
@@ -1683,76 +2034,12 @@ Manual Review
 
 Convert the decimals of the PT to those of the underlying, and adjust the number of Illuminate PTs minted based on that conversion
 
-# Issue H-10: Wrong Illuminate PT allowance checks lead to loss of principal 
-
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/118 
-
-## Found by 
-IllIllI
-
-## Summary
-
-Wrong Illuminate PT allowance checks lead to loss of principal
-
-## Vulnerability Detail
-
-The `ERC5095.withdraw()` function, when called after maturity by a user with an allowance, incorrectly uses the amount of underlying rather than the number of shares the underlying is worth, when adjusting the allowance.
-
-
-## Impact
-
-_Direct theft of any user funds, whether at-rest or in-motion, other than unclaimed yield_
-
-If each underlying is worth less than a share (e.g. if there were losses due to Lido slashing, or the external PT's protocol is paused), then a user will be allowed to take out more shares than they have been given allowance for. If the user granting the approval had minted the Illuminate PT by providing a external PT, in order to become an LP in a pool, the loss of shares is a principal loss.
-
-
-## Code Snippet
-
-The amount of _underlying_ is being subtracted from the allowance, rather than the number of _shares required to retrieve that amount of underlying_:
-```solidity
-// File: src/tokens/ERC5095.sol : ERC5095.withdraw()   #1
-
-262                    uint256 allowance = _allowance[o][msg.sender];
-263 @>                 if (allowance < a) {
-264                        revert Exception(20, allowance, a, address(0), address(0));
-265                    }
-266 @>                 _allowance[o][msg.sender] = allowance - a;
-267                    return
-268                        IRedeemer(redeemer).authRedeem(
-269                            underlying,
-270                            maturity,
-271                            o,
-272                            r,
-273                            a
-274:                       );
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/tokens/ERC5095.sol#L262-L274
-
-Redemptions of Illuminate PTs for underlyings is based on shares of each Illuminate PT's `totalSupply()` of the _available_ underlying, not the expect underlying total, and there is no way for an admin to pause this withdrawal since the `authRedeem()` function does not use the `unpaused` modifier:
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L464
-
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-Calculate how many shares the the amount of underlying is worth (e.g. call `previewWithdraw()`) and use that amount when adjusting the allowance
-
-## Discussion
-
-**sourabhmarathe**
-
-This report will be addressed. The documentation should be updated to reflect what `withdraw` will do for the user after maturity. Given the nature of the redemption process post-maturity, we'll instead have the user specify how many PTs they will burn post-maturity.
-
-
-
 # Issue H-11: Sense PTs can never be redeemed 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/117 
 
 ## Found by 
-Ruhum, IllIllI, 0x52, neumo
+IllIllI, neumo, Ruhum, 0x52
 
 ## Summary
 
@@ -1832,251 +2119,7 @@ Manual Review
 ## Recommendation
 Add the sense yield token to the `Redeemer`'s `Converter` approval during market creation/setting of principal
 
-# Issue H-12: Fee-on-transfer underlyings can be used to mint Illuminate PTs without fees 
-
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/116 
-
-## Found by 
-Bnke0x0, IllIllI, Tomo
-
-## Summary
-
-Fee-on-transfer underlyings can be used to mint Illuminate PTs without fees
-
-
-## Vulnerability Detail
-
-Illuminate's `Lender` does not confirm that the amount of underlying received is the amount provided in the transfer call. If the token is a fee-on-transfer token (e.g. USDT which is [currently](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/test/fork/Contracts.sol#L98) [supported](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/test/fork/Contracts.sol#L61-L62)), then the amount may be less. As long as the fee is smaller than Illuminate's fee, Illuminate will incorrectly trust that the fee has properly been deducted from the contract's balance, and then will swap the funds and mint an Illuminate PT.
-
-
-## Impact
-
-_Theft of unclaimed yield_
-
-Attackers can mint free PT at the expense of Illuminate's fees.
-
-
-## Code Snippet
-
-This is one example from one of the `lend()` functions, but they all have the same issue:
-
-```solidity
-// File: src/Lender.sol : Lender.lend()   #1
-
-750        function lend(
-751            uint8 p,
-752            address u,
-753            uint256 m,
-754            uint256 a,
-755            uint256 r
-756        ) external unpaused(u, m, p) returns (uint256) {
-757            // Instantiate Notional princpal token
-758            address token = IMarketPlace(marketPlace).token(u, m, p);
-759    
-760            // Transfer funds from user to Illuminate
-761  @>        Safe.transferFrom(IERC20(u), msg.sender, address(this), a);
-762    
-763            // Add the accumulated fees to the total
-764            uint256 fee = a / feenominator;
-765            fees[u] = fees[u] + fee;
-766    
-767            // Swap on the Notional Token wrapper
-768  @>        uint256 received = INotional(token).deposit(a - fee, address(this));
-769    
-770            // Verify that we received the principal tokens
-771            if (received < r) {
-772                revert Exception(16, received, r, address(0), address(0));
-773            }
-774    
-775            // Mint Illuminate zero coupons
-776  @>        IERC5095(principalToken(u, m)).authMint(msg.sender, received);
-777    
-778            emit Lend(p, u, m, received, a, msg.sender);
-779            return received;
-780:       }
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L750-L780
-
-
-And separately, if any of the external PTs ever become fee-on-transfer (e.g. CTokens, which are upgradeable), users would be able to mint Illuminate PT directly without having to worry about the FOT fee being smaller than the illuminate one, and the difference would be made up by other PT holders' principal, rather than Illuminate's fees:
-
-```solidity
-// File: src/Lender.sol : Lender.mint()   #2
-
-270        function mint(
-271            uint8 p,
-272            address u,
-273            uint256 m,
-274            uint256 a
-275        ) external unpaused(u, m, p) returns (bool) {
-276            // Fetch the desired principal token
-277            address principal = IMarketPlace(marketPlace).token(u, m, p);
-278    
-279            // Transfer the users principal tokens to the lender contract
-280 @>         Safe.transferFrom(IERC20(principal), msg.sender, address(this), a);
-281    
-282            // Mint the tokens received from the user
-283 @>         IERC5095(principalToken(u, m)).authMint(msg.sender, a);
-284    
-285            emit Mint(p, u, m, a);
-286    
-287            return true;
-288:       }
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L270-L288
-
-
-## POC
-
-Imagine that the Illuminate fee is 1%, and the fee-on-transfer fee for USDT is also 1%
-1. A random unaware user calls one of the `lend()` functions for 100 USDT
-2. `lend()` does the `transferFrom()` for the user and gets 99 USDT due to the USDT 1% fee
-3. `lend()` calculates its own fee as 1% of 100, resulting in 99 USDT remaining
-4. `lend()` swaps the 99 USDT for a external PT
-5. the user is given 99 IPT and only had to spend 100 USDT, and Illuminate got zero actual fee, and actually has to make up the difference itself in order to withdraw _any_ fees (see other issue I've filed about this).
-
-
-## Tool used
-
-Manual Review
-
-
-## Recommendation
-
-Check the actual balance before and after the transfer, and ensure the amount is correct, or use the difference as the amount
-
-
-## Discussion
-
-**sourabhmarathe**
-
-Set label to `high` because based on what the report indicated.
-
-**IllIllI000**
-
-@sourabhmarathe can you elaborate on what aspect of the report made this a high? https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/104 describes a separate way of how to mint IPT using protocol fees
-
-**sourabhmarathe**
-
-I was just updating the issue to reflect what the Watson had put on the report. To me, it appeared mislabeled as the original report had a high level severity at the top of the report.
-
-**sourabhmarathe**
-
-Re #104: It should not be marked as a duplicate. It's a separate issue in it's own right. That said, it doesn't put user funds at risk, so I think it should remain at a Medium.
-
-
-
-# Issue H-13: Illuminate's PTs burn more tokens than are necessary 
-
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/115 
-
-## Found by 
-IllIllI
-
-## Summary
-
-Illuminate's PTs burn more tokens than are necessary to get a specific number of underlying, leading to users getting fewer underlying than they deserve
-
-
-## Vulnerability Detail
-
-`ERC5095.withdraw()/redeem()`'s code relies on `Redeemer.authRedeem()` to do the redemption, but this function always burns the specific amount of PT passed to it, regardless of whether the of whether the PT is worth more than one underlying, which may be the case if there is positive slippage/rewards when the external PT is redeemed, or if the underlying is a rebasing token.
-
-While there are no currently-rebasing underlying tokens listed in the `Contracts.sol` test file, USDC is listed and is an upgradeable contract, which means it may have such functionality in the future for markets that already have users.
-
-
-## Impact
-
-_Theft of unclaimed yield_
-
-Users will get less underlying than they are owed, even though the code is attempting to track funds on a per-share basis, rather than a one-for-one basis.
-
-
-## Code Snippet
-
-The NatSpec says `Burns 'shares' from 'owner' and sends exactly 'assets' of underlying tokens to 'receiver'`, and `shares` is the output parameter (since no other argument has this name), so it's clear that the intention is to provide an exact number of assets, not more. In spite of this, the function calls `Redeemer.authRedeem()`...:
-```solidity
-// File: src/tokens/ERC5095.sol : ERC5095.withdraw()   #1
-
-252                if (o == msg.sender) {
-253                    return
-254 @>                     IRedeemer(redeemer).authRedeem(
-255                            underlying,
-256                            maturity,
-257                            msg.sender,
-258                            r,
-259                            a
-260                        );
-261                } else {
-262                    uint256 allowance = _allowance[o][msg.sender];
-263                    if (allowance < a) {
-264                        revert Exception(20, allowance, a, address(0), address(0));
-265                    }
-266                    _allowance[o][msg.sender] = allowance - a;
-267                    return
-268 @>                     IRedeemer(redeemer).authRedeem(
-269                            underlying,
-270                            maturity,
-271                            o,
-272                            r,
-273                            a
-274                        );
-275                }
-276            }
-277:       }
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/tokens/ERC5095.sol#L252-L277
-
-
-...which always burns the full amount of PTs, even if that results in too many underlying being transferred:
-```solidity
-// File: src/Redeemer.sol : Redeemer.authRedeem()   #2
-
-463            // Calculate the amount redeemed
-464 @>         uint256 redeemed = (a * holdings[u][m]) / pt.totalSupply();
-465    
-466            // Update holdings of underlying
-467            holdings[u][m] = holdings[u][m] - redeemed;
-468    
-469            // Burn the user's principal tokens
-470 @>         pt.authBurn(f, a);
-471    
-472            // Transfer the original underlying token back to the user
-473            Safe.transfer(IERC20(u), t, redeemed);
-474:   
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L463-L474
-
-
-## Tool used
-
-Manual Review
-
-
-## Recommendation
-Change the behavior of `authRedeem()` to calculate how many PTs are required to send the right number of underlying, and only burn that many
-
-## Discussion
-
-**sourabhmarathe**
-
-I was unable to reconcile the slippage across the preview methods to make this work in fork-mode testing. 
-
-In addition, `authRedeem` always will burn the amount of shares (PTs) passed to it. Also, given that the users could lose at most their slippage, I believe this warrants a `medium` label.
-
-**JTraversa**
-
-Ah actually I think this might be a bit different than that ticket in 114 (though I do think there were other duplicates).
-
-I think the question really is whether our keepers are lazy / imprecise enough to provide time for there to be additional yield generation which would warrant additional marginal calculations on redemption.
-
-E.g. depending on the integrated protocol, those calculations can be quite gas heavy. For a protocol like pendle <-> compound, you have to do a read of exchangeRateCurrent which mutates state and costs 77k gas, in addition to any other storage reads.
-
-Would that 77-100k gas be worth it for our users? Prooobably not outside of maybe insane future success and a user with 8 figures deposited in a single market, and even then it would be close.
-
-
-
-# Issue H-14: Illuminate's PT doesn't respect users' slippage specifications 
+# Issue H-12: Illuminate's PT doesn't respect users' slippage specifications 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/114 
 
@@ -2192,14 +2235,50 @@ Yeah unfortunately we also intended some backwards compatability with 4626 (spec
 
 So its difficult to find a great solution other than writing overrides that *do* include additional parameters for slippage protection. IIRC we had issues with bytecode size limits and didnt want to add them but perhaps through other efforts we reduced some headroom there?
 
+**0x00052**
+
+Escalate for 10 USDC
+
+Slight-moderate incorrect slippage controls historically have been graded as medium not high. Seems like there is still ongoing discussion about this issue, but medium seems appropriate if deemed valid.
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC
+> 
+> Slight-moderate incorrect slippage controls historically have been graded as medium not high. Seems like there is still ongoing discussion about this issue, but medium seems appropriate if deemed valid.
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**dmitriia**
+
+Escalate for 10 USDC
+Just to add another point: this should be open/close simultaneously with #181 as the root issue is the same.
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC
+> Just to add another point: this should be open/close simultaneously with #181 as the root issue is the same.
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 
-# Issue H-15: Illuminate redemptions don't account for protocol pauses/temporary blocklistings 
+
+# Issue H-13: Illuminate redemptions don't account for protocol pauses/temporary blocklistings 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/113 
 
 ## Found by 
-ak1, \_\_141345\_\_, ctf\_sec, cccz, rvierdiiev, Jeiwan, Holmgren, kenzo, IllIllI, HonorLt
+Jeiwan, rvierdiiev, ak1, IllIllI, \_\_141345\_\_, cccz, ctf\_sec, HonorLt, kenzo, Holmgren
 
 ## Summary
 
@@ -2431,195 +2510,38 @@ Manual Review
 
 This is hard to solve without missing corner cases, because each external PT may have its own idosyncratic reasons for delays, and there may be losses/slippage involved when redeeming for underlying. I believe the only way that wouldn't allow griefing, would be to track the number of external PTs of each type that were deposited for minting Illuminate PTs on a per-market basis, and `require()` that the number of each that have been redeemed equals the minting count, before allowing the redemption of any Illuminate PTs for that market. You would also need an administrator override that bypasses this check for specific external PTs of specific maturities. All of this assumes that none of the external PTs have rebasing functionality. Also, add the `unpaused` modifier to both `Redeemer.autoRedeem()` and `Redeemer.authRedeem()`.
 
-# Issue H-16: Sense PT redemptions do not allow for known loss scenarios 
-
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/111 
-
-## Found by 
-IllIllI
-
-## Summary
-
-Sense PT redemptions do not allow for known loss scenarios, which will lead to principal losses
-
-
-## Vulnerability Detail
-
-The Sense PT redemption code in the `Redeemer` expects any losses during redemption to be due to a malicious adapter, and requires that there be no losses. However, there are legitimate reasons for there to be losses which aren't accounted for, which will cause the PTs to be unredeemable. The Lido FAQ page lists two such reasons:
-
-```markdown
-- Slashing risk
-
-ETH 2.0 validators risk staking penalties, with up to 100% of staked funds at risk if validators fail. To minimise this risk, Lido stakes across multiple professional and reputable node operators with heterogeneous setups, with additional mitigation in the form of insurance that is paid from Lido fees.
-
-- stETH price risk
-
-Users risk an exchange price of stETH which is lower than inherent value due to withdrawal restrictions on Lido, making arbitrage and risk-free market-making impossible. 
-
-The Lido DAO is driven to mitigate above risks and eliminate them entirely to the extent possible. Despite this, they may still exist and, as such, it is our duty to communicate them.
-```
-https://help.lido.fi/en/articles/5230603-what-are-the-risks-of-staking-with-lido
-
-If Lido is slashed, or there are withdrawal restrictions, the Sense series sponsor will be forced to settle the series, regardless of the exchange rate (or miss out on their [rewards](https://github.com/sense-finance/sense-v1/blob/b71a728e7ce968220860d8bffcaad1c24830fdd0/pkg/core/src/Divider.sol#L181)). The Sense `Divider` contract anticipates and [properly handles](https://github.com/sense-finance/sense-v1/blob/b71a728e7ce968220860d8bffcaad1c24830fdd0/pkg/core/src/Divider.sol#L322-L328) these losses, but the Illuminate code does not.
-
-Lido is just one example of a Sense token that exists in the Illuminate code base - there may be others added in the future which also require there to be allowances for losses.
-
-
-## Impact
-
-_Permanent freezing of funds_
-
-There may be a malicious series sponsor that purposely triggers a loss, either by DOSing Lido validators, or by withdrawing enough to trigger withdrawal restrictions. In such a case, the exchange rate stored by Sense during the settlement will lead to losses, and users that hold Illumimate PTs (not just the users that minted Illuminate PTs with Sense PTs), will lose their principal, because Illuminate PT redemptions are an a share-of-underlying basis, not on the basis of the originally-provided token.
-
-While the Illuminate project does have an emergency `withdraw()` function that would allow an admin to rescue the funds and manually distribute them, this would not be trustless and defeats the purpose of having a smart contract.
-
-
-## Code Snippet
-
-The Sense adapter specifically used in the Illuminate tests is the one that corresponds to wstETH:
-```solidity
-// File: test/fork/Contracts.sol    #1
-36    // (sense adapter)
-37    // NOTE for sense, we have to use the adapter contract to verify the underlying/maturity
-38    // NOTE also we had to use the wsteth pools.... (maturity: 1659312000)
-39:    address constant SENSE_ADAPTER = 0x880E5caBB22D24F3E278C4C760e763f239AccA95;
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/test/fork/Contracts.sol#L36-L39
-
-
-The code for the redemption of the Sense PTs assumes that one PT equals at least one underlying, which may not be the case:
-```solidity
-// File: src/Redeemer.sol : Redeemer.redeem()   #2
-360            // Get the balance of tokens to be redeemed by the user
-361            uint256 amount = token.balanceOf(cachedLender);
-...
-379            IConverter(converter).convert(
-380                compounding,
-381                u,
-382                IERC20(compounding).balanceOf(address(this))
-383            );
-384    
-385            // Get the amount received
-386            uint256 redeemed = IERC20(u).balanceOf(address(this)) - starting;
-387    
-388 @>         // Verify that underlying are received 1:1 - cannot trust the adapter
-389 @>         if (redeemed < amount) {
-390 @>             revert Exception(13, 0, 0, address(0), address(0));
-391            }
-392    
-393            // Update the holdings for this market
-394            holdings[u][m] = holdings[u][m] + redeemed;
-395    
-396            emit Redeem(p, u, m, redeemed, msg.sender);
-397            return true;
-398:       }
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L360-L398
-
-Redemptions of Illuminate PTs for underlyings is based on shares of each Illuminate PT's `totalSupply()` of the _available_ underlying, not the expect underlying total:
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L422
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L464
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L517
-
-
-## Tool used
-
-Manual Review
-
-
-## Recommendation
-Allow losses during redemption if Sense's [`Periphery.verified()`](https://github.com/sense-finance/sense-v1/blob/b71a728e7ce968220860d8bffcaad1c24830fdd0/pkg/core/src/Periphery.sol#L60-L61) returns `true`
-
-
-
 ## Discussion
 
-**sourabhmarathe**
+**JTraversa**
 
-I agree with the stated problem from this report, the only thing I would change about the Recommendation is that we can check is if the Lender contract has approved the periphery.
+Unsure if this is being used as the main ticket for the authRedeem/autoRedeem when paused, as that issue is mentioned alongside the primary description of external PTs that may have been paused, preventing redemption in time for iPT maturity.
 
+If this ticket is primarily regarding the latter, i'd probably contest and claim that we would have ample time between external PT maturity and our own maturity to pause ourselves and remediate any issues should there be external pauses. 
 
+This current implementation of manual pausing saves significant gas when compared to the suggested remediation given the additional storage required for individual market checks, so as long as we are not irresponsible / our keepers are operating, there are no additional risks introduced here that are remediated by checking balances and requiring 1:1 amounts.
 
-# Issue H-17: Notional PT redemptions do not use flash-resistant prices 
+**0x00052**
 
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/110 
+Escalate for 1 USDC
 
-## Found by 
-IllIllI
+Reminder @Evert0x 
 
-## Summary
+**sherlock-admin**
 
-Notional PT redemptions do not use the correct function for determining balances, which will lead to principal losses
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
 
+You've created a valid escalation for 1 USDC!
 
-## Vulnerability Detail
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
 
-EIP-4626 states the following about `maxRedeem()`:
-```markdown
-MUST return the maximum amount of shares that could be transferred from `owner` through `redeem` and not cause a revert, which MUST NOT be higher than the actual maximum that would be accepted (it should underestimate if necessary).
-
-MUST factor in both global and user-specific limits, like if redemption is entirely disabled (even temporarily) it MUST return 0.
-```
-https://github.com/ethereum/EIPs/blob/12fb4072a8204ae89c384a5562dedfdac32a3bec/EIPS/eip-4626.md?plain=1#L414-L416
-
-
-The above means that the implementer is free to return less than the actual balance, and is in fact _required_ to return zero if the token's backing store is paused, and Notional's [can be paused](https://docs.notional.finance/developer-documentation/on-chain/notional-governance-reference#pauseability). While neither of these conditions currently apply to the existing [wfCashERC4626 implementation](https://github.com/notional-finance/wrapped-fcash/blob/ad5c145d9988eeee6e36cf93cc3412449e4e7eba/contracts/wfCashERC4626.sol#L89-L92), there is nothing stopping Notional from implementing the MUST-return-zero-if-paused fix tomorrow, or from changing their implementation to one that requires `maxRedeem()` to return something other than the current balance. 
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 
-## Impact
 
-_Permanent freezing of funds_
-
-If `maxRedeem()` were to return zero, or some other non-exact value, fewer Notional PTs would be redeemed than are available, and users that `redeem()`ed their shares, would receive fewer underlying (principal if they minted Illuminate PTs with Notional PTs, e.g. to be an LP in the pool) than they are owed. The Notional PTs that weren't redeemed would still be available for a subsequent call, but if a user already redeemed their Illuminate PTs, their loss will already be locked in, since their Illuminate PTs will have been burned. This would affect _ALL_ Illuminate PT holders of a specific market, not just the ones that provided the Notional PTs, because Illuminate PT redemptions are an a share-of-underlying basis, not on the basis of the originally-provided token. Markets that are already live with Notional set cannot be protected via a redemption pause by the Illuminate admin, because redemption of `Lender`'s external PTs for underlying does not use the `unpaused` modifier, and does have any access control.
-
-
-## Code Snippet
-
-```solidity
-// File: src/Redeemer.sol : Redeemer.redeem()   #1
-
-309                // Retrieve the pool for the principal token
-310                address pool = ITempusToken(principal).pool();
-311    
-312                // Redeems principal tokens from Tempus
-313                ITempus(tempusAddr).redeemToBacking(pool, amount, 0, address(this));
-314            } else if (p == uint8(MarketPlace.Principals.Apwine)) {
-315                apwineWithdraw(principal, u, amount);
-316            } else if (p == uint8(MarketPlace.Principals.Notional)) {
-317                // Redeems principal tokens from Notional
-318                INotional(principal).redeem(
-319 @>                 INotional(principal).maxRedeem(address(this)),
-320                    address(this),
-321                    address(this)
-322                );
-323            }
-324    
-325            // Calculate how much underlying was redeemed
-326            uint256 redeemed = IERC20(u).balanceOf(address(this)) - starting;
-327    
-328            // Update the holding for this market
-329:           holdings[u][m] = holdings[u][m] + redeemed;
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L309-L329
-
-
-Redemptions of Illuminate PTs for underlyings is based on shares of each Illuminate PT's `totalSupply()` of the _available_ underlying, not the expect underlying total:
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L422
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L464
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L517
-
-
-## Tool used
-
-Manual Review
-
-
-## Recommendation
-
-Use `balanceOf()` rather than `maxRedeem()` in the call to `INotional.redeem()`, and make sure that Illuminate PTs can't be burned if `Lender` still has Notional PTs that it needs to redeem (based on its own accounting of what is remaining, not based on balance checks, so that it can't be griefed with dust).
-
-
-# Issue H-18: APWine PT redemptions can be blocked forever 
+# Issue H-14: APWine PT redemptions can be blocked forever 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/109 
 
@@ -2735,12 +2657,379 @@ Yup! Moved over to confirmed, and the suggested solution is pretty elegant! 👍
 
 
 
+# Issue H-15: Illuminate PTs can be used to mint other Illuminate PTs 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/108 
+
+## Found by 
+pashov, Bnke0x0, Jeiwan, IllIllI, cccz, kenzo, HonorLt, Nyx, 0x52
+
+## Summary
+
+Attackers can inflate away all PT value by unlimited minting
+
+
+## Vulnerability Detail
+
+`Lender.mint()` allows anyone to exchange any supported PT for an Illuminate PT, and Illuminate PTs themselves are supported PTs by the function. By minting Illuminate PTs by providing other Illuminate PTs, an attacker can increase the total supply of Illuminate PTs without the new tokens having any asset backing. Redemptions are based on shares of the total Illuminate PT supply, rather than being redemptions of one underlying for one Illuminate PT, so as the total supply grows, the value of each share decreases.
+
+
+## Impact
+
+_Permanent freezing of funds_
+
+An attacker is able to inflate away the value of Illuminate PTs, making redemptions worthless, which means lenders of the protocol lose all deposited principal. Since the objective of the project is to convert other projects' PTs into Illuminate PTs, PTs of all underlyings and all maturities are affected, meaning 100% of deposited/lent principal are at risk.
+
+While the Illuminate project does have an emergency `withdraw()` function that would allow an admin to rescue the funds and manually distribute them if they're still in the `Lender` contract, an attacker can wait for `Redeemer.redeem()` to have been called, at which point all PTs of the maturity and underlying would be in the `Redeemer` contract, which has no such rescue function. Once the attack became known, it could be prevented by calling `Lender.pause(u, m, 0, true)` for every underlying/maturity combination. Each new maturity would also need a separate call to `pause()`.
+
+
+## Code Snippet
+
+The `mint()` function takes in any value for `p`, including `Principals.Illuminate` (`0`), and mints new Illuminate tokens back to `msg.sender`
+```solidity
+// File: src/Lender.sol : Lender.mint()   #1
+
+270        function mint(
+271            uint8 p,
+272            address u,
+273            uint256 m,
+274            uint256 a
+275        ) external unpaused(u, m, p) returns (bool) {
+276            // Fetch the desired principal token
+277 @>         address principal = IMarketPlace(marketPlace).token(u, m, p);
+278    
+279            // Transfer the users principal tokens to the lender contract
+280            Safe.transferFrom(IERC20(principal), msg.sender, address(this), a);
+281    
+282            // Mint the tokens received from the user
+283 @>         IERC5095(principalToken(u, m)).authMint(msg.sender, a);
+284    
+285            emit Mint(p, u, m, a);
+286    
+287:           return true;
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L270-L287
+
+
+The `IMarketPlace.token()` call does not exclude Illuminate PTs...:
+```solidity
+// File: src/MarketPlace.sol : MarketPlace.token()   #2
+
+605        function token(
+606            address u,
+607            uint256 m,
+608            uint256 p
+609        ) external view returns (address) {
+610 @>         return markets[u][m][p];
+611:       }
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/MarketPlace.sol#L605-L611
+
+
+...and `principalToken()` always returns the Illuminate PT:
+```solidity
+// File: src/Lender.sol : Lender.principalToken()   #3
+
+1051        function principalToken(address u, uint256 m) internal returns (address) {
+1052 @>         return IMarketPlace(marketPlace).token(u, m, 0);
+1053:       }
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L1051-L1053
+
+
+Redemptions of Illuminate PTs for underlyings is based on shares of each Illuminate PT's `totalSupply()` of the _available_ underlying, not the expected underlying total:
+```solidity
+// File: src/Redeemer.sol : Redeemer.redeem()   #4
+
+418            // Get the amount of tokens to be redeemed from the sender
+419            uint256 amount = token.balanceOf(msg.sender);
+420    
+421            // Calculate how many tokens the user should receive
+422 @>         uint256 redeemed = (amount * holdings[u][m]) / token.totalSupply();
+423    
+424            // Update holdings of underlying
+425            holdings[u][m] = holdings[u][m] - redeemed;
+426    
+427            // Burn the user's principal tokens
+428            token.authBurn(msg.sender, amount);
+429    
+430            // Transfer the original underlying token back to the user
+431            Safe.transfer(IERC20(u), msg.sender, redeemed);
+432:   
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L418-L432
+
+and:
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L464
+
+and:
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L517
+
+
+## POC
+
+```diff
+diff --git a/test/fork/Lender.t.sol b/test/fork/Lender.t.sol
+index 999aa2c..6b97001 100644
+--- a/test/fork/Lender.t.sol
++++ b/test/fork/Lender.t.sol
+@@ -90,7 +90,7 @@ contract LenderTest is Test {
+         // Approve lender to spend the underlying
+         IERC20(u).approve(address(l), 2**256 - 1);
+     }
+-
++/**
+     function testYieldLend() public {
+         // Set up the market
+         deployMarket(Contracts.USDC);
+@@ -452,7 +452,7 @@ contract LenderTest is Test {
+             0
+         );
+     }
+-
++/**/
+     function testMint() public {
+         vm.startPrank(msg.sender);
+         IERC20(Contracts.ELEMENT_TOKEN).approve(address(l), startingBalance);
+@@ -468,11 +468,19 @@ contract LenderTest is Test {
+         l.mint(uint8(3), Contracts.USDC, maturity, startingBalance);
+ 
+         address ipt = mp.markets(Contracts.USDC, maturity, 0);
++        IERC20(ipt).approve(address(l), type(uint256).max);
++        l.mint(uint8(0), Contracts.USDC, maturity, 100);
+         assertEq(startingBalance, IERC20(ipt).balanceOf(msg.sender));
+         assertEq(0, IERC20(Contracts.ELEMENT_TOKEN).balanceOf(msg.sender));
+         assertEq(
+             startingBalance,
+             IERC20(Contracts.ELEMENT_TOKEN).balanceOf(address(l))
+         );
++        // since the user's IPT balance is still `startingBalance`
++        // after minting using 100 IPTs, the lender shouldn't have
++        // any IPT balance in order to not have inflation
++        assertEq(IERC20(ipt).balanceOf(address(l)), 0,
++                "There must be no lender IPT balance in order "
++                "to not have inflation");
+     }
+ }
+```
+
+```shell
+$ forge test --fork-url $RPC_URL --fork-block-number 15189976 --use solc:0.8.16 --via-ir --match-test testMint --match-contract Lender -vv
+[⠃] Compiling...
+No files changed, compilation skipped
+
+Running 1 test for test/fork/Lender.t.sol:LenderTest
+[FAIL. Reason: Assertion failed.] testMint() (gas: 2696409)
+Logs:
+  Error: There must be no lender IPT balance in order to not have inflation
+  Error: a == b not satisfied [uint]
+    Expected: 0
+      Actual: 100
+
+Test result: FAILED. 0 passed; 1 failed; finished in 1.64s
+
+Failing tests:
+Encountered 1 failing test in test/fork/Lender.t.sol:LenderTest
+[FAIL. Reason: Assertion failed.] testMint() (gas: 2696409)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+```
+
+## Tool used
+
+Manual Review
+
+
+## Recommendation
+
+Do not allow Illuminate PTs to be used to mint new Illuminate PTs, by making the following change:
+```diff
+diff --git a/src/Lender.sol b/src/Lender.sol
+index b4a0fa2..24a596a 100644
+--- a/src/Lender.sol
++++ b/src/Lender.sol
+@@ -273,6 +273,11 @@ contract Lender {
+         uint256 m,
+         uint256 a
+     ) external unpaused(u, m, p) returns (bool) {
++        // Check that the principal is NOT Illuminate
++        if (p == uint8(MarketPlace.Principals.Illuminate)) {
++            revert Exception(6, 0, 0, address(0), address(0));
++        }
++
+         // Fetch the desired principal token
+         address principal = IMarketPlace(marketPlace).token(u, m, p);
+ 
+```
+
+Alternatively, have the `Lender` burn the original PT if it's an Illuminate PT, before minting the new one
+
+
+
+
+# Issue H-16: User-supplied AMM pools and no input validation allows stealing of stEth protocol fees 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/47 
+
+## Found by 
+IllIllI, 0x52, kenzo
+
+## Summary
+Some of the protocols `lend` methods take as user input the *underlying asset* and the *pool to swap on.*
+They do not check that they match.
+**Therefore a user can supply to `Lender` DAI underlying,
+instruct `Lender` to swap stEth with 0 `minAmountOut`,
+and sandwich the transaction to 0, thereby stealing all of Lender's stEth fees.**
+
+## Vulnerability Detail
+In Tempus, APWine, Sense, Illuminate and Swivel's `lend` methods,
+the underlying, the pool to swap on, and the minAmountOut, are all user inputs.
+**There is no check that they match**,
+and the external swap parameters do not contain the actual asset to swap - only the pool to swap in. Which is a user input.
+So an attacker can do the following, for example with APWine:
+- Let's say `Lender` has accumulated 100 stEth in fees.
+- The attacker will call APWine's `lend`, with `underlying = DAI`, `amount = 100 eth`, `minimumAmountOfTokensToBuy = 0`, and AMM pool (`x`) that is actually for stEth (*tam tam tam!*).
+- `lend` will pull 100 DAI from the attacker.
+- `lend` will call APWine's router with the *stEth pool*, and 0 `minAmountOut`. (I show this in code snippet section below).
+- The attacker will sandwich this whole `lend` call such that `Lender` will receive nearly 0 tokens. This is possible since the user-supplied `minAmountOut` is 0.
+- `lend` will execute this swapping operation. It will receive nearly 0 APWine-stEth-PTs.
+- Since the attacker sandwiched this transaction to 0, he will gain all the stEth that Lender tried to swap - all the stEth fees of the protocol.
+
+## Impact
+Theft of stEth fees, as detailed above.
+
+## Code Snippet
+Here is APWine's `lend` [method](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L572).
+You can notice the following things. Specifically note the `swapExactAmountIn` operation.
+- There is no check that user-supplied `pool` swaps token `u`
+- `apwinePairPath()` and `apwineTokenPath()` do not contain actual asset addresses, but only relative `0` or `1`
+- Therefore, `pool` can be totally unrelated to `u`
+- The user supplies the slippage limit - `r` - so he can use `0`
+- The swap will be executed for the same amount (minus fees) that has been pulled from the user; but user can supply DAI and swap for same amount of stEth, a Very Profitable Trading Strategy
+- We call the real APWine router so `Lender` has already approved it
+
+Because of these, the attack described above will succeed - the user can supply DAI as underlying, but actually make Lender swap stEth with 0 minAmountOut.
+```solidity
+    /// @notice lend method signature for APWine
+    /// @param p principal value according to the MarketPlace's Principals Enum
+    /// @param u address of an underlying asset
+    /// @param m maturity (timestamp) of the market
+    /// @param a amount of underlying tokens to lend
+    /// @param r slippage limit, minimum amount to PTs to buy
+    /// @param d deadline is a timestamp by which the swap must be executed
+    /// @param x APWine router that executes the swap
+    /// @param pool the AMM pool used by APWine to execute the swap
+    /// @return uint256 the amount of principal tokens lent out
+    function lend( uint8 p, address u, uint256 m, uint256 a, uint256 r, uint256 d, address x, address pool) external unpaused(u, m, p) returns (uint256) {
+        address principal = IMarketPlace(marketPlace).token(u, m, p);
+
+        // Transfer funds from user to Illuminate
+        Safe.transferFrom(IERC20(u), msg.sender, address(this), a);
+
+        uint256 lent;
+        {
+            // Add the accumulated fees to the total
+            uint256 fee = a / feenominator;
+            fees[u] = fees[u] + fee;
+
+            // Calculate amount to be lent out
+            lent = a - fee;
+        }
+
+        // Get the starting APWine token balance
+        uint256 starting = IERC20(principal).balanceOf(address(this));
+
+        // Swap on the APWine Pool using the provided market and params
+        IAPWineRouter(x).swapExactAmountIn(
+            pool,
+            apwinePairPath(),
+            apwineTokenPath(),
+            lent,
+            r,
+            address(this),
+            d,
+            address(0)
+        );
+
+        // Calculate the amount of APWine principal tokens received after the swap
+        uint256 received = IERC20(principal).balanceOf(address(this)) -
+            starting;
+
+        // Mint Illuminate zero coupons
+        IERC5095(principalToken(u, m)).authMint(msg.sender, received);
+
+        emit Lend(p, u, m, received, a, msg.sender);
+        return received;
+    }
+
+    function apwineTokenPath() internal pure returns (uint256[] memory) {
+        uint256[] memory tokenPath = new uint256[](2);
+        tokenPath[0] = 1;
+        tokenPath[1] = 0;
+        return tokenPath;
+    }
+
+    /// @notice returns array pair path required for APWine's swap method
+    /// @return array of uint256[] as laid out in APWine's docs
+    function apwinePairPath() internal pure returns (uint256[] memory) {
+        uint256[] memory pairPath = new uint256[](1);
+        pairPath[0] = 0;
+        return pairPath;
+    }
+```
+The situation is similar in:
+- [`Tempus`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L632), where `x` is the pool to swap on.
+- [`Sense`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L725), where `adapter` is user-supplied.
+- [`Illuminate`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L323), where if the principal is Yield, the function [is checking](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L326) that the underlying token matches the pool. But the user can supply the principal to be Illuminate, bypassing this check, and supplying the YieldPool `y` to be one that swaps stEth for fyEth.
+- [`Swivel`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L415), where I believe that the user can supply an order to swap stEth instead of DAI.
+
+## Tool used
+Manual Review
+
+## Recommendation
+Check that the user-supplied pool/adapter/order's tokens match the underlying. This should ensure that the user only swaps assets he supplied.
+
+## Discussion
+
+**0x00052**
+
+Escalate for 25 USDC
+
+This can be used to steal protocol fees, see my issue #161 (duplicate). Loss of funds with no external factors should be high not medium. Historically this has included protocol fees being stolen (see Mover H-1)
+
+**sherlock-admin**
+
+ > Escalate for 25 USDC
+> 
+> This can be used to steal protocol fees, see my issue #161 (duplicate). Loss of funds with no external factors should be high not medium. Historically this has included protocol fees being stolen (see Mover H-1)
+
+You've created a valid escalation for 25 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
 # Issue M-1: Incorrect parameters 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/233 
 
 ## Found by 
-IllIllI, HonorLt
+HonorLt, IllIllI
 
 ## Summary
 Some functions and integrations receive the wrong parameters.
@@ -2810,7 +3099,7 @@ Review all the integrations and function invocations, and make sure the appropri
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/223 
 
 ## Found by 
-hyh, Ruhum
+Ruhum, hyh
 
 ## Summary
 
@@ -3040,6 +3329,39 @@ While the intention of the method is to allow an admin to set a new converter, t
 
 @JTraversa Wouldn't funds be at risk since the Redeemer would be unable to convert PTs to underlying, for users to redeem their IPTs? Looking at some of the other issue comments though, I believe this would will fall under the admin input validation category, and would thus be classified as Low
 
+**JTraversa**
+
+Funds would be at risk _if_ we upgraded the converter contract and changed its implementation.
+
+That said, this is not "normal" execution for the protocol, and the method `setConverter` was simply added at a later time for convenience if we should ever need to do so.
+
+So the feature that is not operational is the upgradability of the converter, rather than any actual funds potentially lost from operation. 
+
+The converter should never need to be upgraded unless we add additional protocol integrations, and with the current implementation this would require a full redeployment given the static array of potentially integration principal tokens.
+
+So I'd see this as a low severity issue impacting upgradability solely.
+
+
+
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x 
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
 
 
 # Issue M-3: Holders of worthless external PTs can stick other Illuminate PT holders with bad debts 
@@ -3152,158 +3474,664 @@ Further, if there is an attack, the attacker would simply just attack illuminate
 
 It all just seems kind of unreasonable, especially as you add additional integrations to the stack (e.g. Illuminate -> Swivel -> Euler -> Lido, do we somehow check EACH of these before every transaction?)
 
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x 
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 
-# Issue M-4: No markets can be created since Illuminate PTs are not ERC-4626 tokens 
 
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/106 
+# Issue M-4: Wrong Illuminate PT allowance checks lead to loss of principal 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/118 
 
 ## Found by 
 IllIllI
 
 ## Summary
 
-No markets can be created since Illuminate PTs are not ERC-4626 tokens, and will cause pool creation to fail
-
+Wrong Illuminate PT allowance checks lead to loss of principal
 
 ## Vulnerability Detail
 
-I checked with the sponsor and they confirmed that the plan was to use yieldspace-tv pools to swap Illuminate PTs for underlying, and that they planned to deploy the [existing pool contract](https://github.com/yieldprotocol/yieldspace-tv/blob/main/src/Pool/Pool.sol), rather than writing a new special [module](https://github.com/yieldprotocol/yieldspace-tv/tree/main/src/Pool/Modules). The existing `Pool` contract relies on the ERC-4626 interface to accomplish some of its tasks (and tokens that do not comply with it need to create new modules in order to override those functions). One such task is the fetching of the price, which relies on `IERC4626.convertToAssets()` which does not exist in the EIP-5095 [spec](https://eips.ethereum.org/EIPS/eip-5095) that the Illuminate PT follows. The fetching of the price is done in the pool constructor, and Illuminate PTs require the pool to already have been immutably set in the market before they're constructed, so therefore there is no way to create a market for any asset.
-
-In addition to not being able to construct the pools, there are other functions such as `asset()`, and `deposit()` (note the flipped args), which do not exist in `ERC5095` but are relied on by the `Pool`, so even if the constructor issue is addressed, things will fail later.
+The `ERC5095.withdraw()` function, when called after maturity by a user with an allowance, incorrectly uses the amount of underlying rather than the number of shares the underlying is worth, when adjusting the allowance.
 
 
 ## Impact
 
-_Smart contract unable to operate due to lack of token funds_
+_Direct theft of any user funds, whether at-rest or in-motion, other than unclaimed yield_
 
-`MarketPlace.createMarket()` can't be called with a valid pool, so nobody can use any feature of the Illuminate project.
+If each underlying is worth less than a share (e.g. if there were losses due to Lido slashing, or the external PT's protocol is paused), then a user will be allowed to take out more shares than they have been given allowance for. If the user granting the approval had minted the Illuminate PT by providing a external PT, in order to become an LP in a pool, the loss of shares is a principal loss.
 
 
 ## Code Snippet
 
-Market creation unconditionally constructs Illuminate PTs:
+The amount of _underlying_ is being subtracted from the allowance, rather than the number of _shares required to retrieve that amount of underlying_:
 ```solidity
-// File: src/MarketPlace.sol : MarketPlace.createMarket()   #1
+// File: src/tokens/ERC5095.sol : ERC5095.withdraw()   #1
 
-150            // Create an Illuminate principal token for the new market
-151            address illuminateToken = address(
-152 @>             new ERC5095(
-153                    u,
-154                    m,
-155                    redeemer,
-156                    lender,
-157                    address(this),
-158                    n,
-159                    s,
-160                    IERC20(u).decimals()
-161                )
-162:           );
+262                    uint256 allowance = _allowance[o][msg.sender];
+263 @>                 if (allowance < a) {
+264                        revert Exception(20, allowance, a, address(0), address(0));
+265                    }
+266 @>                 _allowance[o][msg.sender] = allowance - a;
+267                    return
+268                        IRedeemer(redeemer).authRedeem(
+269                            underlying,
+270                            maturity,
+271                            o,
+272                            r,
+273                            a
+274:                       );
 ```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/MarketPlace.sol#L150-L162
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/tokens/ERC5095.sol#L262-L274
 
+Redemptions of Illuminate PTs for underlyings is based on shares of each Illuminate PT's `totalSupply()` of the _available_ underlying, not the expect underlying total, and there is no way for an admin to pause this withdrawal since the `authRedeem()` function does not use the `unpaused` modifier:
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L464
 
-Illuminate PTs are EIP-5095 contracts, not EIP-4626 ones, and do not implement the `convertToAssets()` function:
-```solidity
-// File: src/tokens/ERC5095.sol   #2
-
-13:@>  contract ERC5095 is ERC20Permit, IERC5095 {
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/tokens/ERC5095.sol#L13
-
-
-The `immutable` pool is set in the constructor, and comes from the `MarketPlace`:
-```solidity
-// File: src/tokens/ERC5095.sol : ERC5095.constructor()   #3
-
-37        constructor(
-38            address _underlying,
-39            uint256 _maturity,
-40            address _redeemer,
-41            address _lender,
-42            address _marketplace,
-43            string memory name_,
-44            string memory symbol_,
-45            uint8 decimals_
-46        ) ERC20Permit(name_, symbol_, decimals_) {
-47            underlying = _underlying;
-48            maturity = _maturity;
-49            redeemer = _redeemer;
-50            lender = _lender;
-51            marketplace = _marketplace;
-52 @>         pool = IMarketPlace(marketplace).pools(underlying, maturity);
-53:       }
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/tokens/ERC5095.sol#L37-L53
-
-Pools must be set ahead of time, and cannot change once set:
-```solidity
-// File: src/MarketPlace.sol : MarketPlace.setPool()   #4
-
-259        function setPool(
-260            address u,
-261            uint256 m,
-262            address a
-263        ) external authorized(admin) returns (bool) {
-264            // Verify that the pool has not already been set
-265            address pool = pools[u][m];
-266    
-267            // Revert if the pool already exists
-268 @>         if (pool != address(0)) {
-269 @>             revert Exception(10, 0, 0, pool, address(0));
-270 @>         }
-271    
-272            // Set the pool
-273            pools[u][m] = a;
-274    
-275            emit SetPool(u, m, a);
-276            return true;
-277:       }
-```
-https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/MarketPlace.sol#L259-L277
-
-Yieldspace-tv `Pool`s rely on the function that does not exist in the Illuminate PT:
-```solidity
-    function _getCurrentSharePrice() internal view virtual returns (uint256) {
-        uint256 scalar = 10**baseDecimals;
-@>      return IERC4626(address(sharesToken)).convertToAssets(scalar);
-    }
-
-
-    /// Returns current price of 1 share in 64bit.
-    /// Useful for external contracts that need to perform calculations related to pool.
-    /// @return The current price (as determined by the token) scalled to 18 digits and converted to 64.64.
-    function getC() external view returns (int128) {
-@>      return _getC();
-    }
-
-
-    /// Returns the c based on the current price
-    function _getC() internal view returns (int128) {
-@>      return (_getCurrentSharePrice() * scaleFactor).divu(1e18);
-    }
-```
-https://github.com/yieldprotocol/yieldspace-tv/blob/8685abc2f57c2f3130165404a77620a3220fb182/src/Pool/Pool.sol#L1400-L1415
-
-`getC()` is called by the constructor, so pools cannot be constructed with Illuminate PTs:
-```solidity
-@>        if ((mu = _getC()) == 0) {
-```
-https://github.com/yieldprotocol/yieldspace-tv/blob/8685abc2f57c2f3130165404a77620a3220fb182/src/Pool/Pool.sol#L193
-
-The existing fork tests mostly use the Yield USDC pool rather than creating an actual new pool.
 
 ## Tool used
 
 Manual Review
 
 ## Recommendation
+Calculate how many shares the the amount of underlying is worth (e.g. call `previewWithdraw()`) and use that amount when adjusting the allowance
 
-Implement a new yieldspace-tv module for EIP-5095 contracts
+## Discussion
+
+**sourabhmarathe**
+
+This report will be addressed. The documentation should be updated to reflect what `withdraw` will do for the user after maturity. Given the nature of the redemption process post-maturity, we'll instead have the user specify how many PTs they will burn post-maturity.
+
+**JTraversa**
+
+This is intended given post maturity previewWithdraw returns a 1:1 amount.
+
+You can utilize the two interchangably, and the suggested remediation actually returns the same thing as the current code.
+
+**JTraversa**
+
+After discussing very briefly with the watson, he does have a rare edge case pointed out, where the heuristic of 1:1 redemptions may not be correct and will lead to slightly incorrect calculation of approvals. 
+
+That said.... this is definitely minimally impactful (especially given the design of PTs / lack of approval usage post maturity), so likely a low-med?
+
+To be honest we could/should? have used a binary yes/no approval process for auto redemption but wanted to utilize storage slots already available
+
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x 
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**KenzoAgada**
+
+Escalate for 50 USDC
+See sponsor's comments.
+To my understanding, as mentioned, first of all the issue necessitates unusual external conditions.
+Furthermore, as the sponsor wrote, the protocol is working on the assumption that shares and underlying are 1:1 ([see `previewWithdraw`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/tokens/ERC5095.sol#L138)). Because of that, the issue's fix practically makes no difference, as `previewWithdraw` anyway returns a 1:1 rate for shares-underlying. Therefore it seems to me that if the issue is valid (which I'm not sure), it should be not higher than a medium.
+
+**sherlock-admin**
+
+ > Escalate for 50 USDC
+> See sponsor's comments.
+> To my understanding, as mentioned, first of all the issue necessitates unusual external conditions.
+> Furthermore, as the sponsor wrote, the protocol is working on the assumption that shares and underlying are 1:1 ([see `previewWithdraw`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/tokens/ERC5095.sol#L138)). Because of that, the issue's fix practically makes no difference, as `previewWithdraw` anyway returns a 1:1 rate for shares-underlying. Therefore it seems to me that if the issue is valid (which I'm not sure), it should be not higher than a medium.
+
+You've created a valid escalation for 50 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
 
 
 
-# Issue M-5: The Pendle version of `lend()` uses the wrong function for swapping fee-on-transfer tokens 
+# Issue M-5: Fee-on-transfer underlyings can be used to mint Illuminate PTs without fees 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/116 
+
+## Found by 
+IllIllI, Bnke0x0, Tomo
+
+## Summary
+
+Fee-on-transfer underlyings can be used to mint Illuminate PTs without fees
+
+
+## Vulnerability Detail
+
+Illuminate's `Lender` does not confirm that the amount of underlying received is the amount provided in the transfer call. If the token is a fee-on-transfer token (e.g. USDT which is [currently](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/test/fork/Contracts.sol#L98) [supported](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/test/fork/Contracts.sol#L61-L62)), then the amount may be less. As long as the fee is smaller than Illuminate's fee, Illuminate will incorrectly trust that the fee has properly been deducted from the contract's balance, and then will swap the funds and mint an Illuminate PT.
+
+
+## Impact
+
+_Theft of unclaimed yield_
+
+Attackers can mint free PT at the expense of Illuminate's fees.
+
+
+## Code Snippet
+
+This is one example from one of the `lend()` functions, but they all have the same issue:
+
+```solidity
+// File: src/Lender.sol : Lender.lend()   #1
+
+750        function lend(
+751            uint8 p,
+752            address u,
+753            uint256 m,
+754            uint256 a,
+755            uint256 r
+756        ) external unpaused(u, m, p) returns (uint256) {
+757            // Instantiate Notional princpal token
+758            address token = IMarketPlace(marketPlace).token(u, m, p);
+759    
+760            // Transfer funds from user to Illuminate
+761  @>        Safe.transferFrom(IERC20(u), msg.sender, address(this), a);
+762    
+763            // Add the accumulated fees to the total
+764            uint256 fee = a / feenominator;
+765            fees[u] = fees[u] + fee;
+766    
+767            // Swap on the Notional Token wrapper
+768  @>        uint256 received = INotional(token).deposit(a - fee, address(this));
+769    
+770            // Verify that we received the principal tokens
+771            if (received < r) {
+772                revert Exception(16, received, r, address(0), address(0));
+773            }
+774    
+775            // Mint Illuminate zero coupons
+776  @>        IERC5095(principalToken(u, m)).authMint(msg.sender, received);
+777    
+778            emit Lend(p, u, m, received, a, msg.sender);
+779            return received;
+780:       }
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L750-L780
+
+
+And separately, if any of the external PTs ever become fee-on-transfer (e.g. CTokens, which are upgradeable), users would be able to mint Illuminate PT directly without having to worry about the FOT fee being smaller than the illuminate one, and the difference would be made up by other PT holders' principal, rather than Illuminate's fees:
+
+```solidity
+// File: src/Lender.sol : Lender.mint()   #2
+
+270        function mint(
+271            uint8 p,
+272            address u,
+273            uint256 m,
+274            uint256 a
+275        ) external unpaused(u, m, p) returns (bool) {
+276            // Fetch the desired principal token
+277            address principal = IMarketPlace(marketPlace).token(u, m, p);
+278    
+279            // Transfer the users principal tokens to the lender contract
+280 @>         Safe.transferFrom(IERC20(principal), msg.sender, address(this), a);
+281    
+282            // Mint the tokens received from the user
+283 @>         IERC5095(principalToken(u, m)).authMint(msg.sender, a);
+284    
+285            emit Mint(p, u, m, a);
+286    
+287            return true;
+288:       }
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L270-L288
+
+
+## POC
+
+Imagine that the Illuminate fee is 1%, and the fee-on-transfer fee for USDT is also 1%
+1. A random unaware user calls one of the `lend()` functions for 100 USDT
+2. `lend()` does the `transferFrom()` for the user and gets 99 USDT due to the USDT 1% fee
+3. `lend()` calculates its own fee as 1% of 100, resulting in 99 USDT remaining
+4. `lend()` swaps the 99 USDT for a external PT
+5. the user is given 99 IPT and only had to spend 100 USDT, and Illuminate got zero actual fee, and actually has to make up the difference itself in order to withdraw _any_ fees (see other issue I've filed about this).
+
+
+## Tool used
+
+Manual Review
+
+
+## Recommendation
+
+Check the actual balance before and after the transfer, and ensure the amount is correct, or use the difference as the amount
+
+
+## Discussion
+
+**sourabhmarathe**
+
+Set label to `high` because based on what the report indicated.
+
+**IllIllI000**
+
+@sourabhmarathe can you elaborate on what aspect of the report made this a high? https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/104 describes a separate way of how to mint IPT using protocol fees
+
+**sourabhmarathe**
+
+I was just updating the issue to reflect what the Watson had put on the report. To me, it appeared mislabeled as the original report had a high level severity at the top of the report.
+
+**sourabhmarathe**
+
+Re #104: It should not be marked as a duplicate. It's a separate issue in it's own right. That said, it doesn't put user funds at risk, so I think it should remain at a Medium.
+
+**JTraversa**
+
+I dont quite think this should be valid all given we are not planning to accept any niche tokens that would include fee on transfers. (We are launching DAI, USDC, stETH)
+
+The admin currently has complete control over market creation meaning suggested remediations increase gas costs for our users with very minimal or no benefit at the moment!
+
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x 
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**KenzoAgada**
+
+Escalate for 50 USDC
+See sponsor's comments.
+
+> I dont quite think this should be valid all given we are not planning to accept any niche tokens that would include fee on transfers. (We are launching DAI, USDC, stETH)
+> 
+> The admin currently has complete control over market creation meaning suggested remediations increase gas costs for our users with very minimal or no benefit at the moment!
+
+While USDT can be upgraded to have FoT, this is an external condition, therefore this issue might be more properly described as a medium at best.
+
+
+**sherlock-admin**
+
+ > Escalate for 50 USDC
+> See sponsor's comments.
+> 
+> > I dont quite think this should be valid all given we are not planning to accept any niche tokens that would include fee on transfers. (We are launching DAI, USDC, stETH)
+> > 
+> > The admin currently has complete control over market creation meaning suggested remediations increase gas costs for our users with very minimal or no benefit at the moment!
+> 
+> While USDT can be upgraded to have FoT, this is an external condition, therefore this issue might be more properly described as a medium at best.
+> 
+
+You've created a valid escalation for 50 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue M-6: Sense PT redemptions do not allow for known loss scenarios 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/111 
+
+## Found by 
+IllIllI
+
+## Summary
+
+Sense PT redemptions do not allow for known loss scenarios, which will lead to principal losses
+
+
+## Vulnerability Detail
+
+The Sense PT redemption code in the `Redeemer` expects any losses during redemption to be due to a malicious adapter, and requires that there be no losses. However, there are legitimate reasons for there to be losses which aren't accounted for, which will cause the PTs to be unredeemable. The Lido FAQ page lists two such reasons:
+
+```markdown
+- Slashing risk
+
+ETH 2.0 validators risk staking penalties, with up to 100% of staked funds at risk if validators fail. To minimise this risk, Lido stakes across multiple professional and reputable node operators with heterogeneous setups, with additional mitigation in the form of insurance that is paid from Lido fees.
+
+- stETH price risk
+
+Users risk an exchange price of stETH which is lower than inherent value due to withdrawal restrictions on Lido, making arbitrage and risk-free market-making impossible. 
+
+The Lido DAO is driven to mitigate above risks and eliminate them entirely to the extent possible. Despite this, they may still exist and, as such, it is our duty to communicate them.
+```
+https://help.lido.fi/en/articles/5230603-what-are-the-risks-of-staking-with-lido
+
+If Lido is slashed, or there are withdrawal restrictions, the Sense series sponsor will be forced to settle the series, regardless of the exchange rate (or miss out on their [rewards](https://github.com/sense-finance/sense-v1/blob/b71a728e7ce968220860d8bffcaad1c24830fdd0/pkg/core/src/Divider.sol#L181)). The Sense `Divider` contract anticipates and [properly handles](https://github.com/sense-finance/sense-v1/blob/b71a728e7ce968220860d8bffcaad1c24830fdd0/pkg/core/src/Divider.sol#L322-L328) these losses, but the Illuminate code does not.
+
+Lido is just one example of a Sense token that exists in the Illuminate code base - there may be others added in the future which also require there to be allowances for losses.
+
+
+## Impact
+
+_Permanent freezing of funds_
+
+There may be a malicious series sponsor that purposely triggers a loss, either by DOSing Lido validators, or by withdrawing enough to trigger withdrawal restrictions. In such a case, the exchange rate stored by Sense during the settlement will lead to losses, and users that hold Illumimate PTs (not just the users that minted Illuminate PTs with Sense PTs), will lose their principal, because Illuminate PT redemptions are an a share-of-underlying basis, not on the basis of the originally-provided token.
+
+While the Illuminate project does have an emergency `withdraw()` function that would allow an admin to rescue the funds and manually distribute them, this would not be trustless and defeats the purpose of having a smart contract.
+
+
+## Code Snippet
+
+The Sense adapter specifically used in the Illuminate tests is the one that corresponds to wstETH:
+```solidity
+// File: test/fork/Contracts.sol    #1
+36    // (sense adapter)
+37    // NOTE for sense, we have to use the adapter contract to verify the underlying/maturity
+38    // NOTE also we had to use the wsteth pools.... (maturity: 1659312000)
+39:    address constant SENSE_ADAPTER = 0x880E5caBB22D24F3E278C4C760e763f239AccA95;
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/test/fork/Contracts.sol#L36-L39
+
+
+The code for the redemption of the Sense PTs assumes that one PT equals at least one underlying, which may not be the case:
+```solidity
+// File: src/Redeemer.sol : Redeemer.redeem()   #2
+360            // Get the balance of tokens to be redeemed by the user
+361            uint256 amount = token.balanceOf(cachedLender);
+...
+379            IConverter(converter).convert(
+380                compounding,
+381                u,
+382                IERC20(compounding).balanceOf(address(this))
+383            );
+384    
+385            // Get the amount received
+386            uint256 redeemed = IERC20(u).balanceOf(address(this)) - starting;
+387    
+388 @>         // Verify that underlying are received 1:1 - cannot trust the adapter
+389 @>         if (redeemed < amount) {
+390 @>             revert Exception(13, 0, 0, address(0), address(0));
+391            }
+392    
+393            // Update the holdings for this market
+394            holdings[u][m] = holdings[u][m] + redeemed;
+395    
+396            emit Redeem(p, u, m, redeemed, msg.sender);
+397            return true;
+398:       }
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L360-L398
+
+Redemptions of Illuminate PTs for underlyings is based on shares of each Illuminate PT's `totalSupply()` of the _available_ underlying, not the expect underlying total:
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L422
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L464
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L517
+
+
+## Tool used
+
+Manual Review
+
+
+## Recommendation
+Allow losses during redemption if Sense's [`Periphery.verified()`](https://github.com/sense-finance/sense-v1/blob/b71a728e7ce968220860d8bffcaad1c24830fdd0/pkg/core/src/Periphery.sol#L60-L61) returns `true`
+
+
+
+## Discussion
+
+**sourabhmarathe**
+
+I agree with the stated problem from this report, the only thing I would change about the Recommendation is that we can check is if the Lender contract has approved the periphery.
+
+**JTraversa**
+
+Hah i find this one kinda funny since another of your tickets recommended doing the opposite and ensuring yield can never be negative.
+
+Buuut i would clarify here that were are not discussing the stETH <-> ETH conversion rates but strictly the actual stETH yields.
+
+So yes, they can be negative should slashing exceed yields, but Lido has historically been nowhere close to this outside of tiny (~1 minutes?) periods. (Even then i am unsure if lido has been slashed yet / I might be confusing them with another staking service) 
+
+Given we have terms of 3+ months, it is extremely unrealistic for this to ever have any impact.
+
+So I would vaguely accept the issue (to align with my report on the other negative yield ticket), and then definitely downgrade this to medium at most, perhaps low.
+
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**KenzoAgada**
+
+Escalate for 40 USDC
+See sponsor's comments. Seems like unlikely external conditions are needed so this might be better described as medium severity.
+
+**sherlock-admin**
+
+ > Escalate for 40 USDC
+> See sponsor's comments. Seems like unlikely external conditions are needed so this might be better described as medium severity.
+
+You've created a valid escalation for 40 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue M-7: Notional PT redemptions do not use flash-resistant prices 
+
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/110 
+
+## Found by 
+IllIllI
+
+## Summary
+
+Notional PT redemptions do not use the correct function for determining balances, which will lead to principal losses
+
+
+## Vulnerability Detail
+
+EIP-4626 states the following about `maxRedeem()`:
+```markdown
+MUST return the maximum amount of shares that could be transferred from `owner` through `redeem` and not cause a revert, which MUST NOT be higher than the actual maximum that would be accepted (it should underestimate if necessary).
+
+MUST factor in both global and user-specific limits, like if redemption is entirely disabled (even temporarily) it MUST return 0.
+```
+https://github.com/ethereum/EIPs/blob/12fb4072a8204ae89c384a5562dedfdac32a3bec/EIPS/eip-4626.md?plain=1#L414-L416
+
+
+The above means that the implementer is free to return less than the actual balance, and is in fact _required_ to return zero if the token's backing store is paused, and Notional's [can be paused](https://docs.notional.finance/developer-documentation/on-chain/notional-governance-reference#pauseability). While neither of these conditions currently apply to the existing [wfCashERC4626 implementation](https://github.com/notional-finance/wrapped-fcash/blob/ad5c145d9988eeee6e36cf93cc3412449e4e7eba/contracts/wfCashERC4626.sol#L89-L92), there is nothing stopping Notional from implementing the MUST-return-zero-if-paused fix tomorrow, or from changing their implementation to one that requires `maxRedeem()` to return something other than the current balance. 
+
+
+## Impact
+
+_Permanent freezing of funds_
+
+If `maxRedeem()` were to return zero, or some other non-exact value, fewer Notional PTs would be redeemed than are available, and users that `redeem()`ed their shares, would receive fewer underlying (principal if they minted Illuminate PTs with Notional PTs, e.g. to be an LP in the pool) than they are owed. The Notional PTs that weren't redeemed would still be available for a subsequent call, but if a user already redeemed their Illuminate PTs, their loss will already be locked in, since their Illuminate PTs will have been burned. This would affect _ALL_ Illuminate PT holders of a specific market, not just the ones that provided the Notional PTs, because Illuminate PT redemptions are an a share-of-underlying basis, not on the basis of the originally-provided token. Markets that are already live with Notional set cannot be protected via a redemption pause by the Illuminate admin, because redemption of `Lender`'s external PTs for underlying does not use the `unpaused` modifier, and does have any access control.
+
+
+## Code Snippet
+
+```solidity
+// File: src/Redeemer.sol : Redeemer.redeem()   #1
+
+309                // Retrieve the pool for the principal token
+310                address pool = ITempusToken(principal).pool();
+311    
+312                // Redeems principal tokens from Tempus
+313                ITempus(tempusAddr).redeemToBacking(pool, amount, 0, address(this));
+314            } else if (p == uint8(MarketPlace.Principals.Apwine)) {
+315                apwineWithdraw(principal, u, amount);
+316            } else if (p == uint8(MarketPlace.Principals.Notional)) {
+317                // Redeems principal tokens from Notional
+318                INotional(principal).redeem(
+319 @>                 INotional(principal).maxRedeem(address(this)),
+320                    address(this),
+321                    address(this)
+322                );
+323            }
+324    
+325            // Calculate how much underlying was redeemed
+326            uint256 redeemed = IERC20(u).balanceOf(address(this)) - starting;
+327    
+328            // Update the holding for this market
+329:           holdings[u][m] = holdings[u][m] + redeemed;
+```
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L309-L329
+
+
+Redemptions of Illuminate PTs for underlyings is based on shares of each Illuminate PT's `totalSupply()` of the _available_ underlying, not the expect underlying total:
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L422
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L464
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L517
+
+
+## Tool used
+
+Manual Review
+
+
+## Recommendation
+
+Use `balanceOf()` rather than `maxRedeem()` in the call to `INotional.redeem()`, and make sure that Illuminate PTs can't be burned if `Lender` still has Notional PTs that it needs to redeem (based on its own accounting of what is remaining, not based on balance checks, so that it can't be griefed with dust).
+
+
+## Discussion
+
+**0x00052**
+
+Escalate for 25 USDC
+
+`While neither of these conditions currently apply to the existing wfCashERC4626 implementation, there is nothing stopping Notional from implementing the MUST-return-zero-if-paused fix tomorrow, or from changing their implementation to one that requires maxRedeem() to return something other than the current balance.`
+
+Watson clearly acknowledges external factors required for loss of funds. There are so many upgradable contracts that Illuminate integrates with. Seems crazy to me to submit a report for every way that any integrated protocol could upgrade to brick/damage this contract. I think low is most appropriate given the requirement that an underlying protocol has to upgrade to cause damage. Worst case medium but I think that is generous.
+
+**sherlock-admin**
+
+ > Escalate for 25 USDC
+> 
+> `While neither of these conditions currently apply to the existing wfCashERC4626 implementation, there is nothing stopping Notional from implementing the MUST-return-zero-if-paused fix tomorrow, or from changing their implementation to one that requires maxRedeem() to return something other than the current balance.`
+> 
+> Watson clearly acknowledges external factors required for loss of funds. There are so many upgradable contracts that Illuminate integrates with. Seems crazy to me to submit a report for every way that any integrated protocol could upgrade to brick/damage this contract. I think low is most appropriate given the requirement that an underlying protocol has to upgrade to cause damage. Worst case medium but I think that is generous.
+
+You've created a valid escalation for 25 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**KenzoAgada**
+
+Escalate for 50 USDC
+See 52's comments above. At the moment no issue is there, the issue is only if Notional's implementation is changed. Might be considered medium severity.
+
+**sherlock-admin**
+
+ > Escalate for 50 USDC
+> See 52's comments above. At the moment no issue is there, the issue is only if Notional's implementation is changed. Might be considered medium severity.
+
+You've created a valid escalation for 50 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted
+
+**sherlock-admin**
+
+> Escalation accepted
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue M-8: The Pendle version of `lend()` uses the wrong function for swapping fee-on-transfer tokens 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/105 
 
@@ -3361,7 +4189,34 @@ Manual Review
 ## Recommendation
 Use `swapExactTokensForTokensSupportingFeeOnTransferTokens()`
 
-# Issue M-6: ERC777 transfer hooks can be used to bypass fees for markets that support Swivel 
+## Discussion
+
+**JTraversa**
+
+Same as #116 
+
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x 
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+
+
+# Issue M-9: ERC777 transfer hooks can be used to bypass fees for markets that support Swivel 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/104 
 
@@ -3459,12 +4314,12 @@ Manual Review
 
 Charge a fee based on the total underlying after the Swivel orders are executed
 
-# Issue M-7: There can only ever be one market with USDT as the underlying 
+# Issue M-10: There can only ever be one market with USDT as the underlying 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/99 
 
 ## Found by 
-IllIllI, Ruhum
+pashov, IllIllI, Ruhum
 
 ## Summary
 
@@ -3549,134 +4404,171 @@ Agree with medium severity
 
 
 
-# Issue M-8: User-supplied AMM pools and no input validation allows stealing of stEth protocol fees 
+# Issue M-11: Users can loose their Illuminate tokens if amount to redeem is greater than holdings[u][m] 
 
-Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/47 
+Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/81 
 
 ## Found by 
-IllIllI, kenzo
+neumo, Jeiwan
 
 ## Summary
-Some of the protocols `lend` methods take as user input the *underlying asset* and the *pool to swap on.*
-They do not check that they match.
-**Therefore a user can supply to `Lender` DAI underlying,
-instruct `Lender` to swap stEth with 0 `minAmountOut`,
-and sandwich the transaction to 0, thereby stealing all of Lender's stEth fees.**
+When a user tries to redeem Illuminate tokens (using the Redeemer contract), the call will burn his/her illuminate tokens in exchange of zero underlying tokens if the amount to redeem exceeds the holdings value for that `[underlying, maturity]` pair.
 
 ## Vulnerability Detail
-In Tempus, APWine, Sense, Illuminate and Swivel's `lend` methods,
-the underlying, the pool to swap on, and the minAmountOut, are all user inputs.
-**There is no check that they match**,
-and the external swap parameters do not contain the actual asset to swap - only the pool to swap in. Which is a user input.
-So an attacker can do the following, for example with APWine:
-- Let's say `Lender` has accumulated 100 stEth in fees.
-- The attacker will call APWine's `lend`, with `underlying = DAI`, `amount = 100 eth`, `minimumAmountOfTokensToBuy = 0`, and AMM pool (`x`) that is actually for stEth (*tam tam tam!*).
-- `lend` will pull 100 DAI from the attacker.
-- `lend` will call APWine's router with the *stEth pool*, and 0 `minAmountOut`. (I show this in code snippet section below).
-- The attacker will sandwich this whole `lend` call such that `Lender` will receive nearly 0 tokens. This is possible since the user-supplied `minAmountOut` is 0.
-- `lend` will execute this swapping operation. It will receive nearly 0 APWine-stEth-PTs.
-- Since the attacker sandwiched this transaction to 0, he will gain all the stEth that Lender tried to swap - all the stEth fees of the protocol.
+Holdings mapping for a `[underlying, maturity]` pair is only increased in  certain function calls.
+`redeem method for Swivel, Yield, Element, Pendle, APWine, Tempus and Notional protocols`
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L329
+`redeem method signature for Sense`
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L394
+But it is decreased in a number of other places, for instance in this function:
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L403-L434
+Which `burns Illuminate principal tokens and sends underlying to user`.
+Acording to the [documentation](https://docs.illuminate.finance/smart-contracts/deposit-lifecycle#mint), 
+>As an alternative to directly lending through Illuminate, users can also purchase external principal tokens and then wrap them at a 1:1 ratio into Illuminate Principal Tokens.
+As an example, let's say a user lends 100 USDC directly on Notional in the December 2022 market at a rate of 5% for one year. This leaves the user with 105 Notional PTs.
+
+>By then calling mint on Lender.sol, this user can then wrap their 105 Notional PTs into 105 Illuminate PTs (likely in order to perform arbitrage).
+Lender: holds 105 Notional (External) PTs
+User: holds 105 Illuminate PTs
+
+So it could happen that a user minted Illuminate tokens, and after maturity try to redeem the underlying before any call has been made to the `redeem` functions above (the ones that increase the holdings). This means that `holdings[u][m]` would be zero and the call to `redeem(address u, uint256 m)` by the user would just burn their Illuminate principal in return for nothing.
+https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Redeemer.sol#L422-L431
+Note that in line 422, the `redeemed` amount is zero because `holdings[u][m]` is zero. So in line 428, the Illuminate tokens are burnt and in line 431 zero (`redeemed`) underlying is transferred to the user.
+This issue is present also in funtions `autoRedeem` and `authRedeem` because both calculate the amount of underlying to redeem as `uint256 redeemed = (amount * holdings[u][m]) / pt.totalSupply();`. For the sake of simplicity, I only present below a PoC of the case of the `redeem(address u, uint256 m)` function to prove the loss of funds.
 
 ## Impact
-Theft of stEth fees, as detailed above.
-
+Loss of user funds in certin scenarios.
 ## Code Snippet
-Here is APWine's `lend` [method](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L572).
-You can notice the following things. Specifically note the `swapExactAmountIn` operation.
-- There is no check that user-supplied `pool` swaps token `u`
-- `apwinePairPath()` and `apwineTokenPath()` do not contain actual asset addresses, but only relative `0` or `1`
-- Therefore, `pool` can be totally unrelated to `u`
-- The user supplies the slippage limit - `r` - so he can use `0`
-- The swap will be executed for the same amount (minus fees) that has been pulled from the user; but user can supply DAI and swap for same amount of stEth, a Very Profitable Trading Strategy
-- We call the real APWine router so `Lender` has already approved it
-
-Because of these, the attack described above will succeed - the user can supply DAI as underlying, but actually make Lender swap stEth with 0 minAmountOut.
+For the case of the `redeem(address u, uint256 m)` function of the Redeemer contract, I wrote the following test that can be included in [Redeemer.t.sol](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/test/fork/Redeemer.t.sol).
 ```solidity
-    /// @notice lend method signature for APWine
-    /// @param p principal value according to the MarketPlace's Principals Enum
-    /// @param u address of an underlying asset
-    /// @param m maturity (timestamp) of the market
-    /// @param a amount of underlying tokens to lend
-    /// @param r slippage limit, minimum amount to PTs to buy
-    /// @param d deadline is a timestamp by which the swap must be executed
-    /// @param x APWine router that executes the swap
-    /// @param pool the AMM pool used by APWine to execute the swap
-    /// @return uint256 the amount of principal tokens lent out
-    function lend( uint8 p, address u, uint256 m, uint256 a, uint256 r, uint256 d, address x, address pool) external unpaused(u, m, p) returns (uint256) {
-        address principal = IMarketPlace(marketPlace).token(u, m, p);
+function testIssueIlluminateRedeem() public {
+	// Deploy market
+	deployMarket(Contracts.USDC, 0);
 
-        // Transfer funds from user to Illuminate
-        Safe.transferFrom(IERC20(u), msg.sender, address(this), a);
+	address principalToken = mp.token(Contracts.USDC, maturity, uint256(MarketPlace.Principals.Yield));
+	address illuminateToken = mp.token(Contracts.USDC, maturity, uint256(MarketPlace.Principals.Illuminate));
 
-        uint256 lent;
-        {
-            // Add the accumulated fees to the total
-            uint256 fee = a / feenominator;
-            fees[u] = fees[u] + fee;
+	// Give msg.sender principal (Yield) tokens
+	deal(principalToken, msg.sender, startingBalance);
 
-            // Calculate amount to be lent out
-            lent = a - fee;
-        }
+	// approve lender to transfer principal tokens
+	vm.startPrank(address(msg.sender));
+	IERC20(principalToken).approve(address(l), startingBalance);
 
-        // Get the starting APWine token balance
-        uint256 starting = IERC20(principal).balanceOf(address(this));
+	// In the starting state, the balance of Yield tokens for the user is equal to startingBalance
+	// and the balance of Illuminate tokens is zero
+	// Both the USDC balance of the user and the holdings mapping in the Redeemer for [u][m] is zero
+	assertEq(IERC20(principalToken).balanceOf(msg.sender), startingBalance);
+	assertEq(IERC20(illuminateToken).balanceOf(msg.sender), 0);
+	assertEq(IERC20(Contracts.USDC).balanceOf(msg.sender), 0);
+	assertEq(r.holdings(Contracts.USDC, maturity), 0);
 
-        // Swap on the APWine Pool using the provided market and params
-        IAPWineRouter(x).swapExactAmountIn(
-            pool,
-            apwinePairPath(),
-            apwineTokenPath(),
-            lent,
-            r,
-            address(this),
-            d,
-            address(0)
-        );
+	// User mints Illuminate tokens by wrapping his/her 1_000 Yield principal tokens
+	l.mint(
+		uint8(MarketPlace.Principals.Yield), // Yield
+		Contracts.USDC, 
+		maturity, 
+		1_000
+	);
+	vm.stopPrank();
 
-        // Calculate the amount of APWine principal tokens received after the swap
-        uint256 received = IERC20(principal).balanceOf(address(this)) -
-            starting;
+	// After minting, the balance of Yield tokens for the user is 1_000 less than the starting balance
+	// and the balance of Illuminate tokens is 1_000
+	// Both the USDC balance of the user and the holdings mapping in the Redeemer for [u][m] is zero
+	assertEq(IERC20(principalToken).balanceOf(msg.sender), startingBalance - 1_000);
+	assertEq(IERC20(illuminateToken).balanceOf(msg.sender), 1_000);
+	assertEq(IERC20(Contracts.USDC).balanceOf(msg.sender), 0);
+	assertEq(r.holdings(Contracts.USDC, maturity), 0);
 
-        // Mint Illuminate zero coupons
-        IERC5095(principalToken(u, m)).authMint(msg.sender, received);
+	assertEq(r.holdings(Contracts.USDC, maturity), 0);
 
-        emit Lend(p, u, m, received, a, msg.sender);
-        return received;
-    }
+	// Try to redeem the underlying as msg.sender
+	vm.prank(msg.sender);
+	r.redeem(Contracts.USDC, maturity);
 
-    function apwineTokenPath() internal pure returns (uint256[] memory) {
-        uint256[] memory tokenPath = new uint256[](2);
-        tokenPath[0] = 1;
-        tokenPath[1] = 0;
-        return tokenPath;
-    }
-
-    /// @notice returns array pair path required for APWine's swap method
-    /// @return array of uint256[] as laid out in APWine's docs
-    function apwinePairPath() internal pure returns (uint256[] memory) {
-        uint256[] memory pairPath = new uint256[](1);
-        pairPath[0] = 0;
-        return pairPath;
-    }
+	// After redeeming, the balance of Yield tokens for the user is 1_000 less than the starting balance
+	// and the balance of Illuminate tokens is zero, they have been burnt
+	// The holdings mapping in the Redeemer for [u][m] is zero
+	// But the USDC balance of the user is also zero, meaning the user has received nothing in return for 
+	// burning their Illuminate
+	assertEq(IERC20(principalToken).balanceOf(msg.sender), startingBalance - 1_000);
+	assertEq(IERC20(illuminateToken).balanceOf(msg.sender), 0);
+	assertEq(IERC20(Contracts.USDC).balanceOf(msg.sender), 0);
+	assertEq(r.holdings(Contracts.USDC, maturity), 0);
+}
 ```
-The situation is similar in:
-- [`Tempus`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L632), where `x` is the pool to swap on.
-- [`Sense`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L725), where `adapter` is user-supplied.
-- [`Illuminate`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L323), where if the principal is Yield, the function [is checking](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L326) that the underlying token matches the pool. But the user can supply the principal to be Illuminate, bypassing this check, and supplying the YieldPool `y` to be one that swaps stEth for fyEth.
-- [`Swivel`](https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L415), where I believe that the user can supply an order to swap stEth instead of DAI.
+You can see how the user mints Illuminate from Yield tokens, then redeems through the Redeemer and ends up with the loss of the Yield tokens he/she used to mint Illuminate.
 
 ## Tool used
-Manual Review
+
+Forge tests and manual Review
 
 ## Recommendation
-Check that the user-supplied pool/adapter/order's tokens match the underlying. This should ensure that the user only swaps assets he supplied.
+Using the `holdings` mapping to track the redeemable Illuminate tokens in the Redeemer contract can only be done if there is no way for an address to have a positive Illuminate tokens balance without the knowledge of the Redeemer contract. I think the team should rethink the way this contract works.
 
-# Issue M-9: Lending on Swivel: protocol fees not taken when remainder of underlying is swapped in YieldPool 
+
+
+## Discussion
+
+**sourabhmarathe**
+
+We expect the user to confirm that the redemption process is fully complete prior to redeeming their Illuminate PTs. We believe this check is best done off-chain and as a result do not include it in Illuminate's `redeem` method.
+
+**neumoxx**
+
+Escalate for 100 USDC
+The fact that a call to redeem can leave the user without his Illuminate tokens and without his principal, and relying on doing this offchain doesn't feel right. I point out in my report the case of `holdings[u][m]` being equal to zero and burning the full amount the user tries to redeem, but in fact it's more general of an issue.
+This line (422 in Redeemer.sol)
+```solidity
+uint256 redeemed = (amount * holdings[u][m]) / token.totalSupply();
+```
+Gets the amount to redeem. But this other line (428 in Redeemer.sol)
+```solidity
+token.authBurn(msg.sender, amount);
+```
+burns the amount passed in. So if a user has (to make it simple) `holdings[u][m] = 2` but has minted another token via `lender.mint` (see my report above), so `totalSupply = 3` and passes an amount of 3 to the function, the value of `redeemed` would be 2 but **the function would burn all three tokens**. Please, give it a second look because it's a big issue imo.
+
+**sherlock-admin**
+
+ > Escalate for 100 USDC
+> The fact that a call to redeem can leave the user without his Illuminate tokens and without his principal, and relying on doing this offchain doesn't feel right. I point out in my report the case of `holdings[u][m]` being equal to zero and burning the full amount the user tries to redeem, but in fact it's more general of an issue.
+> This line (422 in Redeemer.sol)
+> ```solidity
+> uint256 redeemed = (amount * holdings[u][m]) / token.totalSupply();
+> ```
+> Gets the amount to redeem. But this other line (428 in Redeemer.sol)
+> ```solidity
+> token.authBurn(msg.sender, amount);
+> ```
+> burns the amount passed in. So if a user has (to make it simple) `holdings[u][m] = 2` but has minted another token via `lender.mint` (see my report above), so `totalSupply = 3` and passes an amount of 3 to the function, the value of `redeemed` would be 2 but **the function would burn all three tokens**. Please, give it a second look because it's a big issue imo.
+
+You've created a valid escalation for 100 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Evert0x**
+
+Escalation accepted, enforcing a specific order of contract calls off-chain is not secure. Rewarding a medium severity.
+
+**sherlock-admin**
+
+> Escalation accepted, enforcing a specific order of contract calls off-chain is not secure. Rewarding a medium severity.
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue M-12: Lending on Swivel: protocol fees not taken when remainder of underlying is swapped in YieldPool 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/45 
 
 ## Found by 
-kenzo, cccz
+kenzo
 
 ## Summary
 The `lend` function for Swivel allows swapping the remainder underlying on Yield.
@@ -3721,12 +4613,12 @@ Manual Review
 ## Recommendation
 In the `if(e)` block of Swivel's `lend`, extract the protocol fee from `premium`.
 
-# Issue M-10: setPrincipal fails to approve Notional contract to spend lender's underlying tokens 
+# Issue M-13: setPrincipal fails to approve Notional contract to spend lender's underlying tokens 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/41 
 
 ## Found by 
-rvierdiiev, bin2chen, neumo, Holmgren
+minhtrng, bin2chen, neumo, rvierdiiev, Holmgren
 
 ## Summary
 If the **Notional** principal is not set at Marketplace creation, when trying to add it at a later time via **setPrincipal**, the call will not accomplish that the lender approves the notional contract to spend its underlying tokens,  due to passing the zero address as underlying to the lender's approve function.
@@ -3809,7 +4701,28 @@ https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Marketplace.s
 with this:
 `ILender(lender).approve(address(u), address(0), address(0), a);`
 
-# Issue M-11: Marketplace.setPrincipal do not approve needed allowance for Element vault and APWine router 
+## Discussion
+
+**pauliax**
+
+Escalate for 2 USDC.
+Basically, I have described the same issue in a more generic submission: #233
+
+**sherlock-admin**
+
+ > Escalate for 2 USDC.
+> Basically, I have described the same issue in a more generic submission: #233
+
+You've created a valid escalation for 2 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+
+
+# Issue M-14: Marketplace.setPrincipal do not approve needed allowance for Element vault and APWine router 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/40 
 
@@ -3861,12 +4774,12 @@ Issue will stay medium severity, although Illuminate is able to fix it using adm
 
 
 
-# Issue M-12: Redeemer.setFee function will always revert 
+# Issue M-15: Redeemer.setFee function will always revert 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/34 
 
 ## Found by 
-cryptphi, ak1, JohnSmith, rvierdiiev, bin2chen, hansfriese, John
+JohnSmith, ak1, cryptphi, bin2chen, John, hansfriese, rvierdiiev
 
 ## Summary
 `Redeemer.setFee` function will always revert and will not give ability to change `feenominator`.
@@ -3911,12 +4824,40 @@ Manual Review
 Add same functions as in `Lender`.
 https://github.com/sherlock-audit/2022-10-illuminate/blob/main/src/Lender.sol#L813-L829;
 
-# Issue M-13: ERC5095.mint function calculates slippage incorrectly 
+## Discussion
+
+**JTraversa**
+
+1. Agree with Kenzo's escalation
+2. I suppose I might downgrade to low given no funds are at risk (although the function is clearly not functioning as intended)
+
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x 
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+
+
+# Issue M-16: ERC5095.mint function calculates slippage incorrectly 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/31 
 
 ## Found by 
-rvierdiiev, cccz, pashov, bin2chen, kenzo, hansfriese, hyh
+pashov, cccz, bin2chen, hansfriese, kenzo, hyh, rvierdiiev
 
 ## Summary
 ERC5095.mint function calculates slippage incorrectly. This leads to lost of funds for user.
@@ -3989,7 +4930,7 @@ uint128 returned = IMarketPlace(marketplace).sellUnderlying(
         );
 ```
 
-# Issue M-14: ERC5095.deposit doesn't check if received shares is less then provided amount 
+# Issue M-17: ERC5095.deposit doesn't check if received shares is less then provided amount 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/30 
 
@@ -4072,9 +5013,42 @@ Low severity on the basis that ultimately, user funds are not at risk in this ca
 
 Will keep it medium severity as the protocol agrees to fix the issues which can lead to a loss of funds according to the description. 
 
+**JTraversa**
+
+Ehhhh its not quite loss of funds in the way described, but im on the fence with this one.
+
+It kind of seems that this is a discussion about slippage given the "loss" is the same potential marginal loss as the other tickets that discuss slippage within the EIP-5095 interface.
+
+That said, hes correct in saying that crossing the 1:1 ratio would imply a loss which might be good to avoid... And the proposed remediation isnt extremely gas heavy.
+
+Buuut in some other extreme cases there also could be negative APYs? (Look at Europe yo)
+
+E.g. if we did actually implement this, it would mean that we couldnt mechanically operate in a negative yield environment (though i think a lot of stuff would break as well anyways).
+
+If accepted, I'd personally drop it to a low, given the "potential loss" is still a static amount related to the slippage params discussed in other tickets? 🤷 
+
+**0x00052**
+
+Escalate for 1 USDC
+
+Reminder @Evert0x 
+
+**sherlock-admin**
+
+ > Escalate for 1 USDC
+> 
+> Reminder @Evert0x 
+
+You've created a valid escalation for 1 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 
-# Issue M-15: Extra minting after `yield()` function causes iPT supply inflation and skewed accounting 
+
+# Issue M-18: Extra minting after `yield()` function causes iPT supply inflation and skewed accounting 
 
 Source: https://github.com/sherlock-audit/2022-10-illuminate-judging/issues/27 
 
